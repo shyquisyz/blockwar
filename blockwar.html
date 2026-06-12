@@ -357,7 +357,7 @@ function makeEntity(team,x,y,isBot,name){
     ammo:{ak:{mag:CONFIG.weapons.ak.mag,reserve:CONFIG.weapons.ak.reserve},
           pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}},
     fireCd:0,recoil:0,reloading:0,fireLockUntil:0,
-    stepAcc:0,swing:0,
+    stepAcc:0,swing:0,swingType:'slash',swingDur:0.18,stabHold:false,
     // 봇 전용
     aware:false,          // false = 플레이어를 모름 → 기습 보너스 적용됨
     state:"PATROL",path:null,pathI:0,repath:0,stuck:0,lastX:x,lastY:y,
@@ -493,14 +493,19 @@ function tryFire(e,aimAng,focus){
   if(e.reloading>0||e.fireCd>0)return false;
   if(performance.now()/1000<e.fireLockUntil)return false;
   if(wp.melee){
-    e.fireCd=60/wp.rpm; e.swing=0.15;
+    const isStab=(focus&&e===player);
+    e.swingType=isStab?'stab':'slash';
+    e.swingDur=isStab?0.11:0.19;
+    e.fireCd=60/wp.rpm; e.swing=e.swingDur;
     emitNoise(e.x,e.y,wp.noise,e.team,"knife");
     if(e===player||visibleToCam(e))sfx.shot("knife",volByDist(e));
-    // 근접 판정
+    // 찌르기: 좁은 호 + 긴 사거리 / 베기: 넓은 호 + 표준 사거리
+    const hitRange=isStab?62:wp.range;
+    const hitArc=isStab?40*RAD:wp.arc;
     for(const t of entities){
       if(!t.alive||t.team===e.team)continue;
       const d=dist(e.x,e.y,t.x,t.y);
-      if(d<wp.range+t.r&&Math.abs(angDiff(e.angle,Math.atan2(t.y-e.y,t.x-e.x)))<wp.arc/2){
+      if(d<hitRange+t.r&&Math.abs(angDiff(e.angle,Math.atan2(t.y-e.y,t.x-e.x)))<hitArc/2){
         addBlood(t.x,t.y,8);
         if(e===player){hitMarker=0.12;sfx.hit();}
         if(t===remoteEntity&&ws&&ws.readyState===1){
@@ -690,16 +695,37 @@ function updatePlayer(dt,now){
   // 구르기 시작
   if(keys.Space&&!roll.active&&roll.cd<=0){
     roll.active=true;roll.t=0;roll.cd=CONFIG.roll.cooldown;
+    roll.hitSet=new Set();
     if(ml>0){roll.dirX=mx;roll.dirY=my;}
     else{roll.dirX=Math.cos(p.angle);roll.dirY=Math.sin(p.angle);}
     emitNoise(p.x,p.y,CONFIG.roll.noise,p.team,"roll");
     sfx.roll();
+    // 칼 구르기: 베기 모션 시작
+    if(p.weaponKey==='knife'){
+      p.swingType='slash';p.swingDur=CONFIG.roll.time+0.06;p.swing=p.swingDur;
+    }
   }
   if(roll.active){
     roll.t+=dt;
     const sp=CONFIG.roll.dist*(weaponOf(p).rollMult||1)/CONFIG.roll.time;
     moveWithCollision(p,roll.dirX*sp,roll.dirY*sp,dt);
     p.moveMag=1;
+    // 칼 구르기 공격: 이동 중 범위 내 적에게 1회 데미지
+    if(p.weaponKey==='knife'&&roll.hitSet){
+      const kR=CONFIG.weapons.knife.range+16;
+      for(const t of entities){
+        if(!t.alive||t.team===p.team||roll.hitSet.has(t.id))continue;
+        if(dist(p.x,p.y,t.x,t.y)<kR+t.r){
+          roll.hitSet.add(t.id);
+          addBlood(t.x,t.y,8);hitMarker=0.12;sfx.hit();
+          if(t===remoteEntity&&ws&&ws.readyState===1){
+            ws.send(JSON.stringify({type:'hit',dmg:CONFIG.weapons.knife.dmg,head:false}));
+          }else{
+            applyDamage(t,CONFIG.weapons.knife.dmg,false,p);
+          }
+        }
+      }
+    }
     if(roll.t>=CONFIG.roll.time){
       roll.active=false;
       p.fireLockUntil=now+CONFIG.roll.fireLock;
@@ -727,9 +753,12 @@ function updatePlayer(dt,now){
   // 사격
   const wantFire=wp.auto?mouse.l:(mouse.l&&!p.firedHold);
   if(mouse.l){
-    if(wantFire&&!roll.active)tryFire(p,p.angle,mouse.r);
+    if(wantFire&&!roll.active)tryFire(p,p.angle,wp.melee?false:mouse.r);
     p.firedHold=true;
   }else p.firedHold=false;
+  // 칼 우클릭 찌르기 (좌클릭 독립 트리거)
+  if(wp.melee&&mouse.r&&!p.stabHold&&!roll.active)tryFire(p,p.angle,true);
+  p.stabHold=!!(wp.melee&&mouse.r);
 }
 
 // F키 수동 픽업
@@ -1369,10 +1398,32 @@ function drawEntity(e){
   ctx.rotate(e.angle);
   // 칼 휘두름
   if(e.swing>0){
-    ctx.fillStyle="rgba(255,255,255,0.25)";
-    ctx.beginPath();ctx.moveTo(0,0);
-    ctx.arc(0,0,CONFIG.weapons.knife.range,-CONFIG.weapons.knife.arc/2,CONFIG.weapons.knife.arc/2);
-    ctx.closePath();ctx.fill();
+    const kR=CONFIG.weapons.knife.range, kArc=CONFIG.weapons.knife.arc;
+    const prog=Math.min(1,1-(e.swing/(e.swingDur||0.18)));
+    if((e.swingType||'slash')==='stab'){
+      // 찌르기: 우→좌 빠른 스파이크
+      const sR=62, sArc=40*RAD;
+      const ang=sArc/2*(1-prog*2);
+      const fade=1-prog*0.55;
+      ctx.strokeStyle=`rgba(255,200,60,${0.95*fade})`;ctx.lineWidth=4;
+      ctx.beginPath();ctx.moveTo(0,0);ctx.lineTo(Math.cos(ang)*sR,Math.sin(ang)*sR);ctx.stroke();
+      ctx.fillStyle=`rgba(255,175,30,${0.5*fade})`;
+      ctx.beginPath();ctx.moveTo(0,0);
+      ctx.arc(0,0,sR,ang-0.15,ang+0.15);ctx.closePath();ctx.fill();
+      ctx.fillStyle=`rgba(255,240,140,${fade})`;
+      ctx.beginPath();ctx.arc(Math.cos(ang)*sR,Math.sin(ang)*sR,3.5,0,TAU);ctx.fill();
+    }else{
+      // 베기: 좌→우 레이더 스윕
+      const sweepEnd=-kArc/2+prog*kArc;
+      ctx.fillStyle=`rgba(255,220,100,${0.18*(1-prog*0.45)})`;
+      ctx.beginPath();ctx.moveTo(0,0);
+      ctx.arc(0,0,kR,-kArc/2,sweepEnd);ctx.closePath();ctx.fill();
+      ctx.strokeStyle=`rgba(255,220,100,${0.9-prog*0.3})`;ctx.lineWidth=2.5;
+      ctx.beginPath();ctx.moveTo(0,0);
+      ctx.lineTo(Math.cos(sweepEnd)*kR,Math.sin(sweepEnd)*kR);ctx.stroke();
+      ctx.fillStyle=`rgba(255,240,160,${0.8*(1-prog*0.4)})`;
+      ctx.beginPath();ctx.arc(Math.cos(sweepEnd)*kR,Math.sin(sweepEnd)*kR,3,0,TAU);ctx.fill();
+    }
   }
   // 몸통
   ctx.fillStyle=e===player?"#5ba0ff":(e.team===0?"#3f7fd6":"#e05252");
@@ -1892,6 +1943,36 @@ function rr(x,y,w,h,r){
   ctx.arcTo(x,y,x+r,y,r);ctx.closePath();
 }
 
+function drawKeyGuide(cx,cy,w){
+  const rows=[
+    ["W/A/S/D","이동",         "마우스","조준"],
+    ["Shift",  "걷기",         "좌클릭","사격"],
+    ["Space",  "구르기",       "우클릭","집중사격"],
+    ["Q",      "무기 교체",    "R",     "재장전"],
+    ["G",      "무기 버리기",  "칼 우클릭","찌르기"],
+    ["ESC",    "일시정지",     "칼+구르기","구르기 공격"],
+  ];
+  const rh=19,ph=12,th=rows.length*rh+ph*2+22;
+  ctx.fillStyle="rgba(6,12,20,0.88)";ctx.strokeStyle="#182a3e";ctx.lineWidth=1;
+  rr(cx,cy,w,th,8);ctx.fill();ctx.stroke();
+  ctx.font="bold 10px monospace";ctx.fillStyle="#3a6a8a";ctx.textAlign="center";
+  ctx.fillText("키 안내",cx+w/2,cy+ph+8);
+  ctx.strokeStyle="rgba(30,60,90,0.4)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(cx+16,cy+ph+14);ctx.lineTo(cx+w-16,cy+ph+14);ctx.stroke();
+  rows.forEach(([k1,v1,k2,v2],ri)=>{
+    const ry=cy+ph+24+ri*rh;
+    const lc=cx+w*0.25, rc=cx+w*0.75;
+    ctx.font="bold 10px monospace";ctx.fillStyle="#3a80cc";
+    ctx.textAlign="right";ctx.fillText(k1,lc-4,ry);
+    ctx.font="10px sans-serif";ctx.fillStyle="#7aaabf";
+    ctx.textAlign="left";ctx.fillText(v1,lc+2,ry);
+    ctx.font="bold 10px monospace";ctx.fillStyle="#3a80cc";
+    ctx.textAlign="right";ctx.fillText(k2,rc-4,ry);
+    ctx.font="10px sans-serif";ctx.fillStyle="#7aaabf";
+    ctx.textAlign="left";ctx.fillText(v2,rc+2,ry);
+  });
+}
+
 function renderMenu(){
   ctx.textAlign="center";
   // 타이틀
@@ -1950,8 +2031,9 @@ function renderMenu(){
     ctx.textAlign="center";
   });
 
+  drawKeyGuide(W/2-240,H/2+196,480);
   ctx.font="11px sans-serif";ctx.fillStyle="rgba(60,80,100,0.7)";
-  ctx.fillText("© BLOCK WAR ALPHA  —  eser.lbs@gmail.com",W/2,H-24);
+  ctx.fillText("© BLOCK WAR ALPHA  —  eser.lbs@gmail.com",W/2,H-16);
   ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,3,0,TAU);ctx.fill();
 }
 
@@ -1960,7 +2042,7 @@ function renderPause(){
   ctx.fillStyle="rgba(0,0,0,0.72)";
   ctx.fillRect(0,0,W,H);
   // 패널
-  const pw=320,ph=220,px=W/2-pw/2,py=H/2-ph/2;
+  const pw=440,ph=230,px=W/2-pw/2,py=H/2-ph/2;
   ctx.fillStyle="rgba(10,16,24,0.97)";
   ctx.strokeStyle="#2a3e56";ctx.lineWidth=1.5;
   rr(px,py,pw,ph,12);ctx.fill();ctx.stroke();
@@ -1991,7 +2073,9 @@ function renderPause(){
   ctx.fillText("← 메인 메뉴",W/2,H/2+84);
   // ESC 힌트
   ctx.font="11px sans-serif";ctx.fillStyle="rgba(80,100,120,0.7)";
-  ctx.fillText("ESC — 계속하기",W/2,py+ph-16);
+  ctx.fillText("ESC — 계속하기",W/2,py+ph-14);
+  // 키 안내
+  drawKeyGuide(W/2-210,H/2+128,420);
   // 커서 표시 (게임중 커서 숨겨지므로 명시적으로 렌더)
   ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,4,0,TAU);ctx.fill();
   ctx.fillStyle="#0af";ctx.beginPath();ctx.arc(mouse.x,mouse.y,2,0,TAU);ctx.fill();
