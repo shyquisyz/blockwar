@@ -240,8 +240,19 @@ function astar(sx,sy,tx,ty){
 }
 
 /* ---------------- 오디오 (WebAudio 합성) ---------------- */
-let AC=null;
-function audioInit(){if(!AC){AC=new (window.AudioContext||window.webkitAudioContext)();}}
+let AC=null, masterFilter=null;
+function audioInit(){
+  if(!AC){
+    AC=new (window.AudioContext||window.webkitAudioContext)();
+    masterFilter=AC.createBiquadFilter();
+    masterFilter.type="lowpass";masterFilter.frequency.value=22050;
+    masterFilter.connect(AC.destination);
+  }
+}
+function setDeathAudio(dead){
+  if(!masterFilter)return;
+  masterFilter.frequency.setTargetAtTime(dead?380:22050,AC.currentTime,0.12);
+}
 function noiseBurst(dur,lp,vol,delay=0){
   if(!AC)return;
   const t0=AC.currentTime+delay;
@@ -253,7 +264,7 @@ function noiseBurst(dur,lp,vol,delay=0){
   const fl=AC.createBiquadFilter();fl.type="lowpass";fl.frequency.value=lp;
   const gn=AC.createGain();gn.gain.setValueAtTime(vol,t0);
   gn.gain.exponentialRampToValueAtTime(0.001,t0+dur);
-  src.connect(fl);fl.connect(gn);gn.connect(AC.destination);
+  src.connect(fl);fl.connect(gn);gn.connect(masterFilter);
   src.start(t0);
 }
 function tone(freq,dur,vol,type="sine",delay=0){
@@ -262,7 +273,7 @@ function tone(freq,dur,vol,type="sine",delay=0){
   const o=AC.createOscillator();o.type=type;o.frequency.value=freq;
   const g=AC.createGain();g.gain.setValueAtTime(vol,t0);
   g.gain.exponentialRampToValueAtTime(0.001,t0+dur);
-  o.connect(g);g.connect(AC.destination);
+  o.connect(g);g.connect(masterFilter);
   o.start(t0);o.stop(t0+dur);
 }
 const sfx={
@@ -309,7 +320,7 @@ function addBloodStain(x,y,r,life){
   if(bloodStains.length>=MAX_BLOOD_STAINS)bloodStains.shift();
   bloodStains.push({x,y,r,life,maxLife:life});
 }
-let shake=0,hitFlash=0,hitMarker=0;
+let shake=0,hitFlash=0,hitMarker=0,deathT=0;
 // 킬 순간 슬로모션
 let killSlowT=0;          // 남은 시간
 let killFlash=0;          // 처치 플래시 (녹색)
@@ -465,6 +476,7 @@ function kill(e,head,shooter){
   addBloodStain(e.x,e.y,rand(14,20),20);
   addBloodStain(e.x+rand(-18,18),e.y+rand(-18,18),rand(6,10),18);
   addFeed(`${shooter?shooter.name:"?"} ☠ ${e.name}${head?" [헤드샷]":""}`);
+  if(e===player){deathT=0;setDeathAudio(true);}
   // 플레이어가 처치했을 때 킬 이펙트
   if(shooter===player&&e.team===1){
     killSlowT=CONFIG.killEffect.slowDur;
@@ -489,9 +501,13 @@ function tryFire(e,aimAng,focus){
       if(!t.alive||t.team===e.team)continue;
       const d=dist(e.x,e.y,t.x,t.y);
       if(d<wp.range+t.r&&Math.abs(angDiff(e.angle,Math.atan2(t.y-e.y,t.x-e.x)))<wp.arc/2){
-        applyDamage(t,wp.dmg,false,e);
         addBlood(t.x,t.y,8);
         if(e===player){hitMarker=0.12;sfx.hit();}
+        if(t===remoteEntity&&ws&&ws.readyState===1){
+          ws.send(JSON.stringify({type:'hit',dmg:wp.dmg,head:false}));
+        }else{
+          applyDamage(t,wp.dmg,false,e);
+        }
       }
     }
     return true;
@@ -581,6 +597,13 @@ addEventListener("mousedown",ev=>{
         // 방 참가
         lobbyInputMode=true;lobbyInput="";
       }
+      if(lobbyInputMode&&inBtn(W/2-55,H/2+108,110,34)&&lobbyInput.length>=4){
+        if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'join',code:lobbyInput}));
+        lobbyInputMode=false;
+      }
+    }
+    if(netState==="waiting"&&inBtn(W/2-80,H/2+82,160,36)){
+      navigator.clipboard?.writeText(lobbyCode).catch(()=>{});
     }
     if(netState==="error"&&inBtn(W/2-100,H/2+10,200,44)){
       connectToServer();
@@ -939,7 +962,7 @@ function newRound(){
   round.n++;round.state="pre";round.t=CONFIG.round.preTime;
   entities.length=0;corpses.length=0;drops.length=0;rings.length=0;floatTexts.length=0;
   tracers.length=0;particles.length=0;flashes.length=0;bloodStains.length=0;
-  scoped=false;scopeZoom=3.2;killSlowT=0;killFlash=0;timeScale=1;
+  scoped=false;scopeZoom=3.2;killSlowT=0;killFlash=0;timeScale=1;deathT=0;setDeathAudio(false);
   roll={active:false,t:0,dirX:0,dirY:0,cd:0};
   player=makeEntity(0,spawns[0][1].x,spawns[0][1].y,false,"YOU");
   // 선택 무기 장착
@@ -1061,6 +1084,7 @@ function loop(){
   hitFlash=Math.max(0,hitFlash-rawDt*1.4);
   killFlash=Math.max(0,killFlash-rawDt*2.8);
   hitMarker=Math.max(0,hitMarker-rawDt);
+  if(player&&!player.alive)deathT=Math.min(deathT+rawDt,4.0);
 
   render();
 }
@@ -1593,8 +1617,17 @@ function renderHUD(){
       ctx.stroke();
     }
   }else if(player&&!player.alive){
-    ctx.fillStyle="rgba(180,190,200,0.65)";ctx.font="13px sans-serif";ctx.textAlign="center";
-    ctx.fillText("사망 — 관전 중",W/2,H-28);
+    const da=Math.min(deathT/1.8,0.72);
+    ctx.fillStyle=`rgba(0,0,0,${da})`;ctx.fillRect(0,0,W,H);
+    if(deathT>0.5){
+      const ta=Math.min((deathT-0.5)/1.0,1);
+      ctx.save();ctx.globalAlpha=ta;
+      ctx.font="bold 56px monospace";ctx.fillStyle="#c84040";ctx.textAlign="center";
+      ctx.fillText("사망",W/2,H/2-16);
+      ctx.font="16px sans-serif";ctx.fillStyle="rgba(160,180,200,0.85)";
+      ctx.fillText("관전 중",W/2,H/2+24);
+      ctx.restore();
+    }
   }
 
   // ══════════════════════════════════════════
@@ -1690,7 +1723,7 @@ function startOnlineGame(){
   netState="playing";
   entities.length=0;corpses.length=0;drops.length=0;rings.length=0;floatTexts.length=0;
   tracers.length=0;particles.length=0;flashes.length=0;bloodStains.length=0;
-  scoped=false;scopeZoom=3.2;killSlowT=0;killFlash=0;timeScale=1;
+  scoped=false;scopeZoom=3.2;killSlowT=0;killFlash=0;timeScale=1;deathT=0;setDeathAudio(false);
   roll={active:false,t:0,dirX:0,dirY:0,cd:0};
 
   const sp=spawns[mySlot][1];
@@ -1727,7 +1760,8 @@ function sendPlayerState(){
     x:Math.round(player.x),y:Math.round(player.y),
     angle:+player.angle.toFixed(3),
     hp:player.hp,alive:player.alive,
-    wk:player.weaponKey,reload:player.reloading>0
+    wk:player.weaponKey,reload:player.reloading>0,
+    sc:round.scores
   }));
 }
 
@@ -1743,6 +1777,10 @@ function updateRemoteEntity(msg){
     addFeed("나 ☠ 상대");
   }else if(msg.alive!==false&&!remoteEntity.alive){
     remoteEntity.alive=true;remoteEntity.hp=msg.hp;
+  }
+  if(msg.sc){
+    round.scores[0]=Math.max(round.scores[0],msg.sc[0]);
+    round.scores[1]=Math.max(round.scores[1],msg.sc[1]);
   }
 }
 
@@ -1816,8 +1854,7 @@ function renderLobby(){
       ctx.font="bold 26px monospace";ctx.fillStyle="#9fd8ff";
       const blink=Math.floor(Date.now()/500)%2?"▌":"";
       ctx.fillText((lobbyInput||"")+blink,W/2,H/2+82);
-      ctx.font="11px sans-serif";ctx.fillStyle="#4a7a9a";
-      ctx.fillText("코드 입력 후 Enter",W/2,H/2+112);
+      drawBtn(W/2-55,H/2+108,110,34,"▶ 입장","#1a6040");
     }
   }else if(netState==="waiting"){
     ctx.font="14px sans-serif";ctx.fillStyle="#5a8a9a";
@@ -1829,10 +1866,12 @@ function renderLobby(){
     ctx.letterSpacing="8px";
     ctx.fillText(lobbyCode,W/2,H/2+14);
     ctx.letterSpacing="0px";
+    // 코드 복사 버튼
+    drawBtn(W/2-80,H/2+82,160,36,"코드 복사","#1a5a2a");
     // 대기 애니메이션
     const dots=[" ","."," .","  ."," . ."][Math.floor(Date.now()/400)%5];
     ctx.font="15px sans-serif";ctx.fillStyle="#5a8a9a";
-    ctx.fillText("상대방 대기 중"+dots,W/2,H/2+62);
+    ctx.fillText("상대방 대기 중"+dots,W/2,H/2+132);
   }else if(netState==="disconnected"){
     ctx.font="16px sans-serif";ctx.fillStyle="#c08060";
     ctx.fillText("상대방이 연결을 끊었습니다",W/2,H/2-20);
