@@ -26,7 +26,7 @@ const RAD = Math.PI / 180;
 /* ---------------- CONFIG (Inspector 대용) ---------------- */
 const CONFIG = {
   player: { speed: 235, walkMult: 0.5, hp: 100, radius: 13, headRadius: 5.5 },
-  roll:   { dist: 150, time: 0.3, cooldown: 5.0, fireLock: 0.3, noise: 340 },
+  roll:   { dist: 150, time: 0.3, cooldown: 5.0, fireLock: 0.3, noise: 340, chainWin: 0.36, chainCut: 0.12, minCd: 4.0 },
   focus:  { spreadMult: 0.35, speedMult: 0.5 },          // 우클릭 집중 사격
   vision: { fov: 100 * RAD, dist: 470, closeR: 75, rays: 54, fogAlpha: 0.92 },
   bot: {
@@ -59,8 +59,9 @@ const CONFIG = {
     knife:  { name:"칼", slot:3, melee:true, rpm:130, dmg:55,
               range:46, arc:90*RAD, noise:120, speedMult:1.22, rollMult:1.65 }
   },
-  killEffect: { slowDur:0.22, slowScale:0.15 },   // 킬 순간 슬로모션
-  round: { preTime: 1.6, endTime: 2.8 },
+  killEffect: { slowDur:0.22, slowScale:0.15 },
+  round: { preTime: 2.0, endTime: 0.5, resultTime: 3.2 },
+  economy: { start:1000, win:500, loss:300, kill:200, head:100, knife:200 },
   world: { w: 1800, h: 1200 },
   debug: false   // F1 토글: 봇 상태/시야 표시
 };
@@ -102,38 +103,82 @@ let W=0,H=0;
 function resize(){W=cv.width=fog.width=innerWidth;H=cv.height=fog.height=innerHeight;}
 addEventListener("resize",resize); resize();
 
-/* ---------------- 맵 (벽 = AABB) ---------------- */
+/* ---------------- 맵 — Dust2 Flat (탑뷰 단순화) ---------------- */
 const WORLD = CONFIG.world;
 const walls = [
-  // 외곽
-  {x:0,y:0,w:WORLD.w,h:30},{x:0,y:WORLD.h-30,w:WORLD.w,h:30},
-  {x:0,y:0,w:30,h:WORLD.h},{x:WORLD.w-30,y:0,w:30,h:WORLD.h},
-  // 건물
-  {x:250,y:150,w:300,h:200},
-  {x:700,y:100,w:180,h:350},
-  {x:1150,y:150,w:350,h:180},
-  {x:250,y:750,w:300,h:220},
-  {x:700,y:650,w:200,h:200},
-  {x:1200,y:720,w:320,h:230},
-  // 중앙/엄폐물
-  {x:560,y:430,w:70,h:70},
-  {x:860,y:520,w:90,h:90},
-  {x:1090,y:420,w:70,h:70},
-  {x:1000,y:200,w:60,h:120},
-  {x:480,y:980,w:120,h:60},
-  {x:1000,y:980,w:60,h:120},
-  {x:1450,y:430,w:60,h:140},
-  {x:150,y:430,w:60,h:140}
+  // ── 외곽 경계 ──
+  {x:0,   y:0,    w:1800,h:30},
+  {x:0,   y:1170, w:1800,h:30},
+  {x:0,   y:0,    w:30,  h:1200},
+  {x:1770,y:0,    w:30,  h:1200},
+
+  // ── LONG A (상단 복도, T → A사이트) ──
+  {x:30,  y:30,   w:720,h:110},  // 복도 북벽
+  {x:200, y:230,  w:540,h:80},   // 복도 남벽
+  {x:740, y:30,   w:30, h:280},  // A사이트 진입 코너
+
+  // ── SHORT A / MID UPPER ──
+  {x:740, y:340,  w:30, h:200},  // Short-A 좌벽
+  {x:760, y:340,  w:180,h:30},   // Short-A 상단 가로벽
+
+  // ── A 사이트 ──
+  {x:900, y:30,   w:160,h:140},  // A 사이트 CT 진입 대형 박스
+  {x:1100,y:30,   w:380,h:50},   // CT 연결 상단 벽
+  {x:1050,y:200,  w:120,h:110},  // A 사이트 중앙 박스
+  {x:1230,y:160,  w:70, h:150},  // A 사이트 코너 박스
+
+  // ── CT 스폰 구역 ──
+  {x:1480,y:30,   w:290,h:100},  // CT 진입 상단 벽
+  {x:1560,y:130,  w:30, h:290},  // CT 구역 좌벽
+  {x:1480,y:420,  w:290,h:30},   // CT 구역 하단 벽
+  {x:1620,y:450,  w:60, h:60},   // CT 사이트 방어 박스
+
+  // ── MID (중앙) ──
+  {x:680, y:450,  w:30, h:160},  // 미드 T 좌벽
+  {x:710, y:450,  w:160,h:30},   // 미드 윗 횡단 벽
+  {x:710, y:610,  w:160,h:30},   // 미드 아래 횡단 벽
+  {x:870, y:480,  w:100,h:130},  // 미드 중앙 필라
+
+  // ── B 터널 (하단) ──
+  {x:200, y:730,  w:620,h:70},   // 터널 북벽
+  {x:200, y:1090, w:620,h:50},   // 터널 남벽
+  {x:480, y:800,  w:30, h:160},  // 터널 내부 분리벽
+
+  // ── B 사이트 ──
+  {x:960, y:800,  w:140,h:110},  // B 사이트 메인 박스
+  {x:1140,y:860,  w:110,h:110},  // B 사이트 코너 박스
+  {x:1300,y:780,  w:80, h:150},  // B CT 진입 박스
+  {x:1420,y:780,  w:280,h:30},   // B CT 상단 벽
+
+  // ── CT → B 통로 ──
+  {x:1560,y:420,  w:30, h:360},  // CT 구역 우측 통로 벽
+
+  // ── 산개 엄폐물 ──
+  {x:360, y:380,  w:65, h:65},   // T 중앙 박스1
+  {x:360, y:1010, w:65, h:65},   // T 하단 박스
+  {x:800, y:940,  w:65, h:65},   // B 입구 박스
+  {x:1380,y:530,  w:70, h:70},   // CT 미드 박스
+  {x:620, y:700,  w:55, h:55},   // 미드 하단 박스
 ];
-// 봇 순찰 지점
+// 봇 순찰 지점 (Dust2 구조 반영)
 const waypoints = [
-  {x:150,y:120},{x:630,y:80},{x:1650,y:110},{x:960,y:300},
-  {x:120,y:600},{x:640,y:560},{x:980,y:620},{x:1680,y:600},
-  {x:150,y:1080},{x:640,y:1080},{x:1000,y:920},{x:1650,y:1080}
+  {x:100, y:600},  // T spawn
+  {x:320, y:150},  // Long A T side
+  {x:600, y:150},  // Long A entrance
+  {x:980, y:150},  // A site
+  {x:1350,y:300},  // CT → A
+  {x:1680,y:280},  // CT spawn
+  {x:1680,y:600},  // CT mid
+  {x:1350,y:900},  // CT → B
+  {x:1100,y:950},  // B site
+  {x:700, y:900},  // B tunnel exit
+  {x:350, y:900},  // B tunnel T side
+  {x:100, y:800},  // T lower spawn
+  {x:760, y:560},  // Mid
 ];
 const spawns = {
-  0:[{x:110,y:520},{x:110,y:600},{x:110,y:680}],   // 아군(좌측)
-  1:[{x:1690,y:520},{x:1690,y:600},{x:1690,y:680}] // 적(우측)
+  0:[{x:95,y:570},{x:95,y:670},{x:95,y:770}],    // T (좌측)
+  1:[{x:1690,y:200},{x:1690,y:280},{x:1690,y:360}] // CT (우상)
 };
 
 /* ---------------- 레이캐스트 ---------------- */
@@ -359,6 +404,8 @@ function makeEntity(team,x,y,isBot,name){
           pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}},
     fireCd:0,recoil:0,reloading:0,fireLockUntil:0,
     stepAcc:0,swing:0,swingType:'slash',swingDur:0.18,stabHold:false,
+    money:0,roundKills:0,roundHeads:0,roundKnifeKills:0,maxKillDist:0,
+    totalKills:0,totalHeads:0,
     // 봇 전용
     aware:false,          // false = 플레이어를 모름 → 기습 보너스 적용됨
     state:"PATROL",path:null,pathI:0,repath:0,stuck:0,lastX:x,lastY:y,
@@ -467,25 +514,50 @@ function applyDamage(e,dmg,head,shooter){
 function kill(e,head,shooter){
   e.alive=false;e.hp=0;
   corpses.push({x:e.x,y:e.y,angle:e.angle,team:e.team,weapon:e.weaponKey,age:0});
-  // 무기 + 탄약 드랍
   const dropWep=e.weaponKey==="knife"?"pistol":e.weaponKey;
   const dropAm=(e.ammo&&e.ammo[dropWep])||{mag:CONFIG.weapons[dropWep].mag,reserve:0};
   drops.push({x:e.x+rand(-14,14),y:e.y+rand(-14,14),weaponKey:dropWep,mag:dropAm.mag,reserve:dropAm.reserve});
   sfx.death();
   addBlood(e.x,e.y,head?28:18);
-  // 사망 혈흔 — 큰 웅덩이, 20초 유지
   addBloodStain(e.x,e.y,rand(14,20),20);
   addBloodStain(e.x+rand(-18,18),e.y+rand(-18,18),rand(6,10),18);
-  addFeed(`${shooter?shooter.name:"?"} ☠ ${e.name}${head?" [헤드샷]":""}`);
+  const headTag=head?" [헤드샷]":"";
+  addFeed(`${shooter?shooter.name:"?"} ☠ ${e.name}${headTag}`);
   if(e===player){deathT=0;setDeathAudio(true);}
-  // 플레이어가 처치했을 때 킬 이펙트
-  if(shooter===player&&e.team===1){
-    killSlowT=CONFIG.killEffect.slowDur;
-    killFlash=0.45;
-    sfx.killConfirm();
-    shake=Math.max(shake,head?4.5:2.5);
-    floatTexts.push({wx:e.x,wy:e.y-16,t:0,life:1.4,vy:-60,text:head?"+300 헤드샷!":"+300",color:head?"#f9d74a":"#4cd47a",size:head?20:18});
+  if(shooter===player&&e.team!==player.team){
+    _awardKill(e,head,shooter);
   }
+}
+function _awardKill(e,head,shooter){
+  const isKnife=shooter.weaponKey==="knife";
+  const killDist=Math.round(dist(shooter.x,shooter.y,e.x,e.y));
+  const isBackstab=e.isBot&&Math.abs(angDiff(e.angle,Math.atan2(shooter.y-e.y,shooter.x-e.x)))>2.1;
+  const isLong=killDist>550;
+  const eco=CONFIG.economy;
+  // Economy
+  let earned=eco.kill;
+  if(isKnife)earned+=eco.knife;
+  if(head)earned+=eco.head;
+  shooter.money+=earned;
+  // Stats
+  shooter.roundKills++;shooter.totalKills++;
+  if(head){shooter.roundHeads++;shooter.totalHeads++;}
+  if(isKnife)shooter.roundKnifeKills++;
+  if(killDist>shooter.maxKillDist)shooter.maxKillDist=killDist;
+  // Effects
+  killSlowT=CONFIG.killEffect.slowDur;killFlash=0.45;
+  sfx.killConfirm();
+  shake=Math.max(shake,head?4.5:2.5);
+  // Staggered float texts
+  let fy=e.y-10,delay=0;
+  const push=(text,color,size)=>{
+    floatTexts.push({wx:e.x,wy:fy,t:delay,life:1.6,vy:-50,text,color,size:size||16});
+    fy-=size?size+6:22;delay+=0.08;
+  };
+  push(isKnife?`KNIFE KILL  +${eco.kill+eco.knife}`:`KILL  +${eco.kill}`,isKnife?"#ff9940":"#4cd47a",18);
+  if(head)push(`HEADSHOT  +${eco.head}`,"#f9d74a",14);
+  if(isLong)push(`${killDist}px`,"#88ccff",12);
+  if(isBackstab)push("BACKSTAB","#ff6688",12);
 }
 
 /* ---------------- 발사/장전 공통 ---------------- */
@@ -703,9 +775,15 @@ function updatePlayer(dt,now){
   if(ml>0){mx/=ml;my/=ml;}
   const walking=keys.ShiftLeft||keys.ShiftRight;
   roll.cd=Math.max(0,roll.cd-dt);
+  if(roll.chainWin>0)roll.chainWin=Math.max(0,roll.chainWin-dt);
   // 구르기 시작
   if(keys.Space&&!roll.active&&roll.cd<=0){
-    roll.active=true;roll.t=0;roll.cd=CONFIG.roll.cooldown;
+    let cd=CONFIG.roll.cooldown;
+    if(roll.chainWin>0){
+      cd=Math.max(CONFIG.roll.minCd,cd*(1-CONFIG.roll.chainCut));
+      floatTexts.push({wx:p.x,wy:p.y-32,t:0,life:0.9,vy:-28,text:"RHYTHM",color:"#88ffcc",size:12});
+    }
+    roll.active=true;roll.t=0;roll.cd=cd;roll.chainWin=0;
     roll.hitSet=new Set();
     if(ml>0){roll.dirX=mx;roll.dirY=my;}
     else{roll.dirX=Math.cos(p.angle);roll.dirY=Math.sin(p.angle);}
@@ -740,6 +818,7 @@ function updatePlayer(dt,now){
     if(roll.t>=CONFIG.roll.time){
       roll.active=false;
       p.fireLockUntil=now+CONFIG.roll.fireLock;
+      roll.chainWin=CONFIG.roll.chainWin;
     }
   }else{
     let sp=CONFIG.player.speed*wp.speedMult;
@@ -932,7 +1011,7 @@ function updateBot(b,dt){
 }
 
 /* ---------------- 라운드 ---------------- */
-const round={n:0,state:"pre",t:0,scores:[0,0],msg:""};
+const round={n:0,state:"pre",t:0,scores:[0,0],msg:"",scored:false,result:null};
 let gameState="menu";
 const weaponChoices=[
   {key:"awp", label:"AWP", desc:"원샷 처치  |  느린 이동  |  좁은 시야"},
@@ -1001,15 +1080,16 @@ addEventListener("keydown",ev=>{
 
 function startGame(){
   chosenWeapon=weaponChoices[titleWeaponIdx].key;
-  round.n=0;round.scores=[0,0];gameState="game";newRound();
+  round.n=0;round.scores=[0,0];round.scored=false;round.result=null;gameState="game";newRound();
 }
 function newRound(){
   if(netState==="playing"){startOnlineGame();return;}
+  round.scored=false;round.result=null;
   round.n++;round.state="pre";round.t=CONFIG.round.preTime;
   entities.length=0;corpses.length=0;drops.length=0;rings.length=0;floatTexts.length=0;
   tracers.length=0;particles.length=0;flashes.length=0;bloodStains.length=0;
   scoped=false;scopeZoom=3.2;killSlowT=0;killFlash=0;timeScale=1;deathT=0;setDeathAudio(false);
-  roll={active:false,t:0,dirX:0,dirY:0,cd:0};
+  roll={active:false,t:0,dirX:0,dirY:0,cd:0,chainWin:0};
   player=makeEntity(0,spawns[0][1].x,spawns[0][1].y,false,"YOU");
   // 선택 무기 장착
   player.weaponKey=chosenWeapon;
@@ -1026,21 +1106,45 @@ function newRound(){
                  pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}};
     player.prevKey="pistol";
   }
+  // money: 첫 라운드 1000, 이후 유지 (라운드 보상 누적)
+  if(round.n===1)player.money=CONFIG.economy.start;
+  player.roundKills=0;player.roundHeads=0;player.roundKnifeKills=0;player.maxKillDist=0;
   entities.push(player);
   entities.push(makeEntity(0,spawns[0][0].x,spawns[0][0].y,true,"아군1"));
   entities.push(makeEntity(0,spawns[0][2].x,spawns[0][2].y,true,"아군2"));
   for(let i=0;i<3;i++)entities.push(makeEntity(1,spawns[1][i].x,spawns[1][i].y,true,"적"+(i+1)));
 }
 function checkWin(){
+  if(round.state!=="play"||round.scored)return;
   const a=entities.filter(e=>e.team===0&&e.alive).length;
   const b=entities.filter(e=>e.team===1&&e.alive).length;
   if(a===0||b===0){
-    round.state="end";round.t=CONFIG.round.endTime;
+    round.scored=true;
     const team0wins=b===0;
     if(team0wins)round.scores[0]++;else round.scores[1]++;
     const myTeam=player?player.team:0;
-    round.msg=(team0wins===(myTeam===0))?"라운드 승리!":"라운드 패배...";
+    const iWin=team0wins===(myTeam===0);
+    round.msg=iWin?"라운드 승리!":"라운드 패배...";
+    if(player){player.money+=(iWin?CONFIG.economy.win:CONFIG.economy.loss);}
+    round.result=compileResult(iWin);
+    round.state="end";round.t=CONFIG.round.endTime;
   }
+}
+function compileResult(iWin){
+  const eco=CONFIG.economy;
+  const p=player;
+  return{
+    win:iWin,
+    moneyGain:iWin?eco.win:eco.loss,
+    kills:p?p.roundKills:0,
+    heads:p?p.roundHeads:0,
+    knifeKills:p?p.roundKnifeKills:0,
+    maxDist:p?p.maxKillDist:0,
+    weapon:p?p.weaponKey:"ak",
+    totalMoney:p?p.money:0,
+    scores:[...round.scores],
+    myTeam:p?p.team:0
+  };
 }
 
 /* ---------------- 카메라 ---------------- */
@@ -1105,6 +1209,9 @@ function loop(){
       }
       checkWin();
     }else if(round.state==="end"){
+      round.t-=dt;
+      if(round.t<=0){round.state="result";round.t=CONFIG.round.resultTime;}
+    }else if(round.state==="result"){
       round.t-=dt;
       if(round.t<=0)newRound();
     }
@@ -1247,12 +1354,24 @@ function render(){
     }
   }
 
+  // 바닥 구역 색상 (Dust2 느낌)
+  // A사이트
+  ctx.fillStyle="rgba(160,140,100,0.12)";ctx.fillRect(820,30,560,340);
+  // B사이트
+  ctx.fillStyle="rgba(100,120,160,0.10)";ctx.fillRect(820,760,600,380);
+  // 터널
+  ctx.fillStyle="rgba(80,90,80,0.12)";ctx.fillRect(200,730,640,360);
   // 벽
   for(const w of walls){
-    ctx.fillStyle="#3a4150";
+    ctx.fillStyle="#3a4250";
     ctx.fillRect(w.x,w.y,w.w,w.h);
-    ctx.fillStyle="#4a5365";
-    ctx.fillRect(w.x,w.y,w.w,4);
+    // 상단 하이라이트 (높이감)
+    ctx.fillStyle="#505a6a";
+    ctx.fillRect(w.x,w.y,w.w,Math.min(5,w.h));
+    // 좌측 그림자
+    ctx.fillStyle="rgba(0,0,0,0.22)";
+    ctx.fillRect(w.x+w.w-4,w.y,4,w.h);
+    ctx.fillRect(w.x,w.y+w.h-4,w.w,4);
   }
 
   // 엔티티
@@ -1570,8 +1689,8 @@ function renderHUD(){
   // ══════════════════════════════════════════
   if(player){
     const hpPx=180,hpH=12;
-    const px=20,py=H-72;
-    hudPanel(px,py,224,62);
+    const px=20,py=H-88;
+    hudPanel(px,py,224,78);
 
     const hpR=clamp(player.hp/CONFIG.player.hp,0,1);
     const hpColor=player.hp>50?"#4cd47a":(player.hp>25?"#f0c040":"#e84040");
@@ -1600,12 +1719,21 @@ function renderHUD(){
     ctx.fillStyle="rgba(255,255,255,0.08)";
     ctx.fillRect(px+12,py+48,hpPx,5);
     const rollFill=roll.cd<=0?1:1-roll.cd/CONFIG.roll.cooldown;
-    ctx.fillStyle=roll.cd<=0?"#5ba0ff":"#3a4e6a";
+    const chainGlow=roll.chainWin>0;
+    ctx.fillStyle=chainGlow?"#44ffaa":(roll.cd<=0?"#5ba0ff":"#3a4e6a");
     ctx.fillRect(px+12,py+48,hpPx*rollFill,5);
+    if(chainGlow){
+      ctx.strokeStyle=`rgba(68,255,170,${roll.chainWin/CONFIG.roll.chainWin*0.6})`;
+      ctx.lineWidth=1.5;ctx.strokeRect(px+12,py+48,hpPx,5);
+    }
     ctx.fillStyle="rgba(159,179,200,0.5)";ctx.font="9px monospace";ctx.textAlign="left";
     ctx.fillText("ROLL",px+12,py+60);
     ctx.textAlign="right";
     ctx.fillText(roll.cd<=0?"READY":`${roll.cd.toFixed(1)}s`,px+195,py+60);
+    // 자금 표시
+    ctx.textAlign="left";ctx.font="bold 11px monospace";
+    ctx.fillStyle="rgba(180,200,160,0.8)";
+    ctx.fillText(`$ ${player.money}`,px+12,py+76);
   }
 
   // ══════════════════════════════════════════
@@ -1704,16 +1832,25 @@ function renderHUD(){
       ctx.stroke();
     }
   }else if(player&&!player.alive){
-    const da=Math.min(deathT/1.8,0.72);
-    ctx.fillStyle=`rgba(0,0,0,${da})`;ctx.fillRect(0,0,W,H);
-    if(deathT>0.5){
-      const ta=Math.min((deathT-0.5)/1.0,1);
-      ctx.save();ctx.globalAlpha=ta;
-      ctx.font="bold 56px monospace";ctx.fillStyle="#c84040";ctx.textAlign="center";
-      ctx.fillText("사망",W/2,H/2-16);
-      ctx.font="16px sans-serif";ctx.fillStyle="rgba(160,180,200,0.85)";
-      ctx.fillText("관전 중",W/2,H/2+24);
-      ctx.restore();
+    // Phase 4: 0.5s 뮤트 → 1s vignette → 1.5s 암전 → 관전
+    if(deathT>=0.5&&deathT<1.5){
+      const vp=clamp((deathT-0.5)/1.0,0,1);
+      const grad=ctx.createRadialGradient(W/2,H/2,Math.min(W,H)*0.28,W/2,H/2,Math.max(W,H)*0.72);
+      grad.addColorStop(0,`rgba(0,0,0,0)`);
+      grad.addColorStop(1,`rgba(0,0,0,${vp*0.88})`);
+      ctx.fillStyle=grad;ctx.fillRect(0,0,W,H);
+    }else if(deathT>=1.5){
+      const fa=clamp((deathT-1.5)/0.6,0,0.82);
+      ctx.fillStyle=`rgba(0,0,0,${fa})`;ctx.fillRect(0,0,W,H);
+      if(deathT>2.0){
+        const ta=clamp((deathT-2.0)/0.7,0,1);
+        ctx.save();ctx.globalAlpha=ta;
+        ctx.font="bold 56px monospace";ctx.fillStyle="#c84040";ctx.textAlign="center";
+        ctx.fillText("사망",W/2,H/2-16);
+        ctx.font="16px sans-serif";ctx.fillStyle="rgba(160,180,200,0.85)";
+        ctx.fillText("관전 중",W/2,H/2+24);
+        ctx.restore();
+      }
     }
   }
 
@@ -1734,9 +1871,8 @@ function renderHUD(){
   }
   if(killSlowT>0){
     const ka=killSlowT/CONFIG.killEffect.slowDur;
-    ctx.fillStyle=`rgba(60,210,110,${ka*0.55})`;
-    ctx.font="bold 28px monospace";ctx.textAlign="center";
-    ctx.fillText("KILL",W/2,H/2-8);
+    ctx.strokeStyle=`rgba(60,210,110,${ka*0.4})`;
+    ctx.lineWidth=3;ctx.strokeRect(3,3,W-6,H-6);
   }
 
   // ══════════════════════════════════════════
@@ -1757,6 +1893,8 @@ function renderHUD(){
     ctx.fillText(round.msg,W/2,H/2+6);
     ctx.font="16px monospace";ctx.fillStyle="rgba(180,195,210,0.8)";
     {const _ms=player?round.scores[player.team]:round.scores[0];const _ts=player?round.scores[1-player.team]:round.scores[1];ctx.fillText(`${_ms}  —  ${_ts}`,W/2,H/2+36);}
+  }else if(round.state==="result"){
+    renderResult();
   }
 
   // ══════════════════════════════════════════
@@ -1764,6 +1902,51 @@ function renderHUD(){
   // ══════════════════════════════════════════
   ctx.textAlign="left";ctx.font="10px monospace";ctx.fillStyle="rgba(120,140,160,0.4)";
   ctx.fillText("WASD · Shift · Space · 우클릭 · R · 1/2/3 · F1",24,H-8);
+}
+
+function renderResult(){
+  const r=round.result;if(!r)return;
+  const pw=480,ph=300,px=W/2-pw/2,py=H/2-ph/2;
+  ctx.fillStyle="rgba(0,0,0,0.82)";ctx.fillRect(0,0,W,H);
+  ctx.fillStyle=r.win?"rgba(8,26,12,0.97)":"rgba(26,8,8,0.97)";
+  ctx.strokeStyle=r.win?"#2a8a4a":"#8a2a2a";ctx.lineWidth=2;
+  rr(px,py,pw,ph,14);ctx.fill();ctx.stroke();
+  ctx.fillStyle=r.win?"#2a8a4a":"#8a2a2a";rr(px+1,py+1,pw-2,5,3);ctx.fill();
+  ctx.textAlign="center";
+  ctx.font="bold 13px monospace";ctx.fillStyle="rgba(200,220,240,0.4)";
+  ctx.fillText("RESULT",W/2,py+22);
+  ctx.font="bold 36px monospace";ctx.fillStyle=r.win?"#4cd47a":"#e84040";
+  ctx.fillText(r.win?"라운드 승리":"라운드 패배",W/2,py+62);
+  const ms=r.scores[r.myTeam],ts=r.scores[1-r.myTeam];
+  ctx.font="14px monospace";ctx.fillStyle="rgba(180,195,215,0.7)";
+  ctx.fillText(`${ms}  :  ${ts}`,W/2,py+84);
+  // 구분선
+  ctx.strokeStyle="rgba(255,255,255,0.07)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(px+24,py+96);ctx.lineTo(px+pw-24,py+96);ctx.stroke();
+  // Stats 그리드
+  const col=(bx,by,label,val,color)=>{
+    ctx.font="10px monospace";ctx.fillStyle="rgba(140,160,180,0.6)";ctx.textAlign="left";
+    ctx.fillText(label,bx,by);
+    ctx.font="bold 16px monospace";ctx.fillStyle=color||"#d0dce8";
+    ctx.fillText(val,bx,by+20);
+  };
+  const lx=px+30,ry=py+114;
+  col(lx,       ry,"KILLS",r.kills,"#4cd47a");
+  col(lx+100,   ry,"HEADSHOTS",r.heads,"#f9d74a");
+  col(lx+220,   ry,"KNIFE KILLS",r.knifeKills,"#ff9940");
+  col(lx+340,   ry,"MAX DIST",r.maxDist?`${r.maxDist}px`:"—","#88ccff");
+  // 무기
+  const wpName=CONFIG.weapons[r.weapon]?.name||r.weapon;
+  col(lx,ry+48,"WEAPON",wpName,"#9fb3c8");
+  // 획득 자금
+  col(lx+160,ry+48,"EARNED",`+${r.moneyGain}`,"#c8e870");
+  col(lx+280,ry+48,"BALANCE",`$${r.totalMoney}`,"#b8d070");
+  // 진행 바 (남은 시간)
+  const prog=1-round.t/CONFIG.round.resultTime;
+  ctx.fillStyle="rgba(255,255,255,0.06)";ctx.fillRect(px+24,py+ph-22,pw-48,4);
+  ctx.fillStyle=r.win?"#2a7a3a":"#7a2a2a";ctx.fillRect(px+24,py+ph-22,(pw-48)*prog,4);
+  ctx.font="10px sans-serif";ctx.fillStyle="rgba(120,140,160,0.5)";ctx.textAlign="center";
+  ctx.fillText("다음 라운드 준비 중...",W/2,py+ph-6);
 }
 
 /* ===================== 온라인 멀티플레이어 ===================== */
@@ -1811,7 +1994,8 @@ function startOnlineGame(){
   entities.length=0;corpses.length=0;drops.length=0;rings.length=0;floatTexts.length=0;
   tracers.length=0;particles.length=0;flashes.length=0;bloodStains.length=0;
   scoped=false;scopeZoom=3.2;killSlowT=0;killFlash=0;timeScale=1;deathT=0;setDeathAudio(false);
-  roll={active:false,t:0,dirX:0,dirY:0,cd:0};
+  roll={active:false,t:0,dirX:0,dirY:0,cd:0,chainWin:0};
+  round.scored=false;round.result=null;
 
   const sp=spawns[mySlot][1];
   player=makeEntity(mySlot,sp.x,sp.y,false,"나");
@@ -1828,6 +2012,8 @@ function startOnlineGame(){
     player.ammo={ak:{mag:CONFIG.weapons.ak.mag,reserve:CONFIG.weapons.ak.reserve},
                  pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}};
   }
+  if(round.n===1)player.money=CONFIG.economy.start;
+  player.roundKills=0;player.roundHeads=0;player.roundKnifeKills=0;player.maxKillDist=0;
   entities.push(player);
 
   const rsp=spawns[1-mySlot][1];
@@ -1862,6 +2048,16 @@ function updateRemoteEntity(msg){
     corpses.push({x:remoteEntity.x,y:remoteEntity.y,angle:remoteEntity.angle,team:remoteEntity.team,weapon:remoteEntity.weaponKey,age:0});
     sfx.death();
     addFeed("나 ☠ 상대");
+    // 1v1 온라인: 상대 사망 = 내가 처치 → 크레딧 부여
+    if(player&&player.alive){
+      const eco=CONFIG.economy;
+      player.money+=eco.kill;
+      player.roundKills++;player.totalKills++;
+      killSlowT=CONFIG.killEffect.slowDur;killFlash=0.45;sfx.killConfirm();
+      shake=Math.max(shake,2.5);
+      floatTexts.push({wx:remoteEntity.x,wy:remoteEntity.y-10,t:0,life:1.6,vy:-50,
+        text:`KILL  +${eco.kill}`,color:"#4cd47a",size:18});
+    }
   }else if(msg.alive!==false&&!remoteEntity.alive){
     remoteEntity.alive=true;remoteEntity.hp=msg.hp;
   }
