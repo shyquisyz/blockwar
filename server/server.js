@@ -31,8 +31,9 @@ wss.on('connection', ws => {
   };
 
   ws.on('message', raw => {
+    const data = raw.toString();   // Buffer → string (binary frame 방지)
     let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
+    try { msg = JSON.parse(data); } catch { return; }
 
     if (msg.type === 'create') {
       do { code = genCode(); } while (rooms[code]);
@@ -61,18 +62,18 @@ wss.on('connection', ws => {
       stateCnt[code] = (stateCnt[code] || 0) + 1;
       if (stateCnt[code] % 100 === 1)
         console.log(`[${code}] STATE RECEIVED from slot${slot} ×${stateCnt[code]} x=${msg.x} y=${msg.y}`);
-      relay(raw, 'state');
+      relay(data, 'state');
 
     } else if (msg.type === 'shot') {
       console.log(`[${code}] SHOT RECEIVED from slot${slot} wk=${msg.wk}`);
-      relay(raw, 'shot');
+      relay(data, 'shot');
 
     } else if (msg.type === 'hit') {
       console.log(`[${code}] HIT RECEIVED from slot${slot} dmg=${msg.dmg} head=${msg.head}`);
-      relay(raw, 'hit');
+      relay(data, 'hit');
 
     } else {
-      relay(raw, msg.type);
+      relay(data, msg.type);
     }
   });
 
