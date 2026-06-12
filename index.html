@@ -75,6 +75,7 @@ let lobbyCode = "";
 let lobbyInput = "";
 let lobbyInputMode = false;
 let netSendTimer = 0;
+let showKeyGuide = false;
 
 /* ---------------- 유틸 ---------------- */
 const clamp = (v,a,b)=>v<a?a:(v>b?b:v);
@@ -588,6 +589,7 @@ addEventListener("mousemove",ev=>{mouse.x=ev.clientX;mouse.y=ev.clientY;});
 function inBtn(bx,by,bw,bh){return mouse.x>=bx&&mouse.x<=bx+bw&&mouse.y>=by&&mouse.y<=by+bh;}
 addEventListener("mousedown",ev=>{
   audioInit();
+  if(showKeyGuide){showKeyGuide=false;return;}
   if(gameState==="lobby"){
     // 무기 선택 버튼 (항상 클릭 가능)
     [{key:"ak"},{key:"smg"},{key:"awp"}].forEach((wc,i)=>{
@@ -607,7 +609,7 @@ addEventListener("mousedown",ev=>{
         lobbyInputMode=false;
       }
     }
-    if(netState==="waiting"&&inBtn(W/2-80,H/2+82,160,36)){
+    if(netState==="waiting"&&inBtn(W/2-160,H/2-60,320,80)){
       navigator.clipboard?.writeText(lobbyCode).catch(()=>{});
     }
     if(netState==="error"&&inBtn(W/2-100,H/2+10,200,44)){
@@ -631,6 +633,9 @@ addEventListener("mousedown",ev=>{
         }else{menuModeIdx=i;}
       }
     });
+    // 키 안내 버튼
+    const kgbw2=130,kgbx2=W/2-kgbw2/2,kgby2=H/2+196;
+    if(ev.clientX>=kgbx2&&ev.clientX<=kgbx2+kgbw2&&ev.clientY>=kgby2&&ev.clientY<=kgby2+30){showKeyGuide=true;}
     return;
   }
   if(gameState==="title"){
@@ -650,10 +655,10 @@ addEventListener("mousedown",ev=>{
     return;
   }
   if(gameState==="paused"){
-    // 계속하기 / 메인메뉴 버튼
-    const bw=280,bx=W/2-bw/2;
-    if(ev.clientX>=bx&&ev.clientX<=bx+bw&&ev.clientY>=H/2-10&&ev.clientY<=H/2+40){gameState="game";}
-    if(ev.clientX>=bx&&ev.clientX<=bx+bw&&ev.clientY>=H/2+54&&ev.clientY<=H/2+104){gameState="menu";scoped=false;}
+    const bw=260,bx=W/2-bw/2;
+    if(ev.clientX>=bx&&ev.clientX<=bx+bw&&ev.clientY>=H/2-20&&ev.clientY<=H/2+26){gameState="game";}
+    if(ev.clientX>=bx&&ev.clientX<=bx+bw&&ev.clientY>=H/2+38&&ev.clientY<=H/2+84){gameState="menu";scoped=false;}
+    if(ev.clientX>=bx&&ev.clientX<=bx+bw&&ev.clientY>=H/2+96&&ev.clientY<=H/2+130){showKeyGuide=true;}
     return;
   }
   if(ev.button===0)mouse.l=true;
@@ -666,6 +671,12 @@ addEventListener("mousedown",ev=>{
 addEventListener("mouseup",ev=>{
   if(ev.button===0)mouse.l=false;
   if(ev.button===2)mouse.r=false;
+});
+addEventListener("paste",ev=>{
+  if(gameState==="lobby"&&lobbyInputMode){
+    const t=(ev.clipboardData?.getData("text")||"").trim().toUpperCase().replace(/[^A-Z0-9]/g,"").slice(0,6);
+    if(t.length>=4){lobbyInput=t;ev.preventDefault();}
+  }
 });
 addEventListener("wheel",ev=>{
   if(!scoped)return;
@@ -939,6 +950,7 @@ let menuModeIdx=0;
 
 addEventListener("keydown",ev=>{
   if(ev.code==="Space")ev.preventDefault();
+  if(showKeyGuide){if(ev.code==="Escape"){showKeyGuide=false;ev.stopPropagation();}return;}
   if(gameState==="lobby"){
     if(lobbyInputMode){
       if(ev.code==="Backspace"){lobbyInput=lobbyInput.slice(0,-1);}
@@ -946,6 +958,11 @@ addEventListener("keydown",ev=>{
       else if((ev.code==="Enter"||ev.code==="NumpadEnter")&&lobbyInput.length>=4){
         if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'join',code:lobbyInput}));
         lobbyInputMode=false;
+      }else if((ev.ctrlKey||ev.metaKey)&&ev.code==="KeyV"){
+        navigator.clipboard?.readText().then(t=>{
+          const clean=t.trim().toUpperCase().replace(/[^A-Z0-9]/g,"").slice(0,6);
+          if(clean.length>=4)lobbyInput=clean;
+        }).catch(()=>{});
       }else if(lobbyInput.length<6&&ev.key&&ev.key.length===1&&/[A-Za-z0-9]/.test(ev.key)){
         lobbyInput+=ev.key.toUpperCase();
       }
@@ -1121,9 +1138,9 @@ function loop(){
 /* ---------------- 렌더 ---------------- */
 function render(){
   ctx.fillStyle="#0b0d10";ctx.fillRect(0,0,W,H);
-  if(gameState==="menu"){renderMenu();return;}
-  if(gameState==="lobby"){renderLobby();return;}
-  if(gameState==="title"){renderTitle();return;}
+  if(gameState==="menu"){renderMenu();if(showKeyGuide)renderKeyGuide();return;}
+  if(gameState==="lobby"){renderLobby();if(showKeyGuide)renderKeyGuide();return;}
+  if(gameState==="title"){renderTitle();if(showKeyGuide)renderKeyGuide();return;}
   const c=camEnt();
   const sx=shake>0?rand(-shake,shake):0, sy=shake>0?rand(-shake,shake):0;
   camRX=clamp(c.x,W/2-200,WORLD.w-W/2+200)+sx;
@@ -1390,6 +1407,7 @@ function render(){
 
   renderHUD();
   if(gameState==="paused")renderPause();
+  if(showKeyGuide)renderKeyGuide();
 }
 
 function drawEntity(e){
@@ -1400,30 +1418,48 @@ function drawEntity(e){
   if(e.swing>0){
     const kR=CONFIG.weapons.knife.range, kArc=CONFIG.weapons.knife.arc;
     const prog=Math.min(1,1-(e.swing/(e.swingDur||0.18)));
+    ctx.save();ctx.lineCap="round";
     if((e.swingType||'slash')==='stab'){
-      // 찌르기: 우→좌 빠른 스파이크
-      const sR=62, sArc=40*RAD;
+      // 찌르기: 빠른 스러스트 우→좌
+      const sR=64,sArc=40*RAD;
       const ang=sArc/2*(1-prog*2);
-      const fade=1-prog*0.55;
-      ctx.strokeStyle=`rgba(255,200,60,${0.95*fade})`;ctx.lineWidth=4;
-      ctx.beginPath();ctx.moveTo(0,0);ctx.lineTo(Math.cos(ang)*sR,Math.sin(ang)*sR);ctx.stroke();
-      ctx.fillStyle=`rgba(255,175,30,${0.5*fade})`;
-      ctx.beginPath();ctx.moveTo(0,0);
-      ctx.arc(0,0,sR,ang-0.15,ang+0.15);ctx.closePath();ctx.fill();
-      ctx.fillStyle=`rgba(255,240,140,${fade})`;
-      ctx.beginPath();ctx.arc(Math.cos(ang)*sR,Math.sin(ang)*sR,3.5,0,TAU);ctx.fill();
+      const ext=Math.min(1,prog*5);
+      const fade=Math.max(0,1-prog*1.35);
+      const ex=Math.cos(ang)*sR*ext,ey=Math.sin(ang)*sR*ext;
+      ctx.globalAlpha=0.32*fade;ctx.strokeStyle="#ff7800";ctx.lineWidth=20;
+      ctx.beginPath();ctx.moveTo(Math.cos(ang)*5,Math.sin(ang)*5);ctx.lineTo(ex,ey);ctx.stroke();
+      ctx.globalAlpha=0.88*fade;ctx.strokeStyle="#ffbf30";ctx.lineWidth=5;
+      ctx.beginPath();ctx.moveTo(Math.cos(ang)*8,Math.sin(ang)*8);ctx.lineTo(ex,ey);ctx.stroke();
+      ctx.globalAlpha=0.72*fade;ctx.strokeStyle="#ffffc0";ctx.lineWidth=1.5;
+      ctx.beginPath();ctx.moveTo(Math.cos(ang)*10,Math.sin(ang)*10);ctx.lineTo(ex,ey);ctx.stroke();
+      if(ext>0.45){
+        ctx.globalAlpha=fade*0.9;ctx.fillStyle="#ffee80";
+        ctx.beginPath();ctx.arc(ex,ey,4.5,0,TAU);ctx.fill();
+        ctx.globalAlpha=fade*0.28;ctx.fillStyle="#ffaa20";
+        ctx.beginPath();ctx.arc(ex,ey,11,0,TAU);ctx.fill();
+      }
     }else{
-      // 베기: 좌→우 레이더 스윕
+      // 베기: 레이더 스윕 좌→우
       const sweepEnd=-kArc/2+prog*kArc;
-      ctx.fillStyle=`rgba(255,220,100,${0.18*(1-prog*0.45)})`;
-      ctx.beginPath();ctx.moveTo(0,0);
-      ctx.arc(0,0,kR,-kArc/2,sweepEnd);ctx.closePath();ctx.fill();
-      ctx.strokeStyle=`rgba(255,220,100,${0.9-prog*0.3})`;ctx.lineWidth=2.5;
-      ctx.beginPath();ctx.moveTo(0,0);
-      ctx.lineTo(Math.cos(sweepEnd)*kR,Math.sin(sweepEnd)*kR);ctx.stroke();
-      ctx.fillStyle=`rgba(255,240,160,${0.8*(1-prog*0.4)})`;
-      ctx.beginPath();ctx.arc(Math.cos(sweepEnd)*kR,Math.sin(sweepEnd)*kR,3,0,TAU);ctx.fill();
+      const leading=Math.max(-kArc/2,sweepEnd-0.55);
+      const fade=1-prog*0.18;
+      ctx.globalAlpha=0.10*fade;ctx.fillStyle="#ffdd50";
+      ctx.beginPath();ctx.moveTo(0,0);ctx.arc(0,0,kR,-kArc/2,sweepEnd);ctx.closePath();ctx.fill();
+      ctx.globalAlpha=0.28*fade;ctx.strokeStyle="#ffcc20";ctx.lineWidth=16;
+      ctx.beginPath();ctx.arc(0,0,kR,leading,sweepEnd);ctx.stroke();
+      ctx.globalAlpha=0.88*fade;ctx.strokeStyle="#ffe050";ctx.lineWidth=3.5;
+      ctx.beginPath();ctx.arc(0,0,kR,-kArc/2,sweepEnd);ctx.stroke();
+      ctx.globalAlpha=0.68*fade;ctx.strokeStyle="#fffff0";ctx.lineWidth=1.2;
+      ctx.beginPath();ctx.arc(0,0,kR,leading,sweepEnd);ctx.stroke();
+      ctx.globalAlpha=0.82*fade;ctx.strokeStyle="#ffffc0";ctx.lineWidth=2.2;
+      ctx.beginPath();ctx.moveTo(0,0);ctx.lineTo(Math.cos(sweepEnd)*kR,Math.sin(sweepEnd)*kR);ctx.stroke();
+      const tx=Math.cos(sweepEnd)*kR,ty=Math.sin(sweepEnd)*kR;
+      ctx.globalAlpha=0.92*fade;ctx.fillStyle="#fff8b0";
+      ctx.beginPath();ctx.arc(tx,ty,4.5,0,TAU);ctx.fill();
+      ctx.globalAlpha=0.32*fade;ctx.fillStyle="#ffdd20";
+      ctx.beginPath();ctx.arc(tx,ty,10,0,TAU);ctx.fill();
     }
+    ctx.restore();
   }
   // 몸통
   ctx.fillStyle=e===player?"#5ba0ff":(e.team===0?"#3f7fd6":"#e05252");
@@ -1910,19 +1946,19 @@ function renderLobby(){
   }else if(netState==="waiting"){
     ctx.font="14px sans-serif";ctx.fillStyle="#5a8a9a";
     ctx.fillText("이 코드를 상대방에게 알려주세요",W/2,H/2-80);
-    // 큰 코드 표시
-    ctx.fillStyle="rgba(10,20,30,0.85)";ctx.strokeStyle="#4a8aaa";ctx.lineWidth=1.5;
+    const codeHov=inBtn(W/2-160,H/2-60,320,80);
+    ctx.fillStyle=codeHov?"rgba(18,40,58,0.95)":"rgba(10,20,30,0.85)";
+    ctx.strokeStyle=codeHov?"#68c8f8":"#4a8aaa";ctx.lineWidth=codeHov?2:1.5;
     rr(W/2-160,H/2-60,320,80,12);ctx.fill();ctx.stroke();
-    ctx.font="bold 62px monospace";ctx.fillStyle="#f0e060";
+    ctx.font="bold 62px monospace";ctx.fillStyle=codeHov?"#fff060":"#f0e060";
     ctx.letterSpacing="8px";
     ctx.fillText(lobbyCode,W/2,H/2+14);
     ctx.letterSpacing="0px";
-    // 코드 복사 버튼
-    drawBtn(W/2-80,H/2+82,160,36,"코드 복사","#1a5a2a");
-    // 대기 애니메이션
+    ctx.font="10px sans-serif";ctx.fillStyle=codeHov?"rgba(100,200,255,0.9)":"rgba(80,140,180,0.5)";
+    ctx.fillText("클릭하면 복사",W/2,H/2+46);
     const dots=[" ","."," .","  ."," . ."][Math.floor(Date.now()/400)%5];
     ctx.font="15px sans-serif";ctx.fillStyle="#5a8a9a";
-    ctx.fillText("상대방 대기 중"+dots,W/2,H/2+132);
+    ctx.fillText("상대방 대기 중"+dots,W/2,H/2+100);
   }else if(netState==="disconnected"){
     ctx.font="16px sans-serif";ctx.fillStyle="#c08060";
     ctx.fillText("상대방이 연결을 끊었습니다",W/2,H/2-20);
@@ -1943,34 +1979,89 @@ function rr(x,y,w,h,r){
   ctx.arcTo(x,y,x+r,y,r);ctx.closePath();
 }
 
-function drawKeyGuide(cx,cy,w){
-  const rows=[
-    ["W/A/S/D","이동",         "마우스","조준"],
-    ["Shift",  "걷기",         "좌클릭","사격"],
-    ["Space",  "구르기",       "우클릭","집중사격"],
-    ["Q",      "무기 교체",    "R",     "재장전"],
-    ["G",      "무기 버리기",  "칼 우클릭","찌르기"],
-    ["ESC",    "일시정지",     "칼+구르기","구르기 공격"],
-  ];
-  const rh=19,ph=12,th=rows.length*rh+ph*2+22;
-  ctx.fillStyle="rgba(6,12,20,0.88)";ctx.strokeStyle="#182a3e";ctx.lineWidth=1;
-  rr(cx,cy,w,th,8);ctx.fill();ctx.stroke();
-  ctx.font="bold 10px monospace";ctx.fillStyle="#3a6a8a";ctx.textAlign="center";
-  ctx.fillText("키 안내",cx+w/2,cy+ph+8);
-  ctx.strokeStyle="rgba(30,60,90,0.4)";ctx.lineWidth=1;
-  ctx.beginPath();ctx.moveTo(cx+16,cy+ph+14);ctx.lineTo(cx+w-16,cy+ph+14);ctx.stroke();
-  rows.forEach(([k1,v1,k2,v2],ri)=>{
-    const ry=cy+ph+24+ri*rh;
-    const lc=cx+w*0.25, rc=cx+w*0.75;
-    ctx.font="bold 10px monospace";ctx.fillStyle="#3a80cc";
-    ctx.textAlign="right";ctx.fillText(k1,lc-4,ry);
-    ctx.font="10px sans-serif";ctx.fillStyle="#7aaabf";
-    ctx.textAlign="left";ctx.fillText(v1,lc+2,ry);
-    ctx.font="bold 10px monospace";ctx.fillStyle="#3a80cc";
-    ctx.textAlign="right";ctx.fillText(k2,rc-4,ry);
-    ctx.font="10px sans-serif";ctx.fillStyle="#7aaabf";
-    ctx.textAlign="left";ctx.fillText(v2,rc+2,ry);
-  });
+function renderKeyGuide(){
+  ctx.fillStyle="rgba(0,0,0,0.88)";ctx.fillRect(0,0,W,H);
+  const pw=600,ph=365,px=W/2-pw/2,py=H/2-ph/2;
+  ctx.fillStyle="rgba(7,12,22,0.98)";ctx.strokeStyle="#1e3454";ctx.lineWidth=2;
+  rr(px,py,pw,ph,14);ctx.fill();ctx.stroke();
+  ctx.fillStyle="#1a4070";rr(px+1,py+1,pw-2,5,3);ctx.fill();
+  ctx.font="bold 20px monospace";ctx.fillStyle="#68b8ec";ctx.textAlign="center";
+  ctx.fillText("키  안  내",W/2,py+36);
+  ctx.strokeStyle="rgba(30,60,100,0.4)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(px+24,py+50);ctx.lineTo(px+pw-24,py+50);ctx.stroke();
+  const KW=38,KH=34,KG=4,KR=5;
+  const K=(bx,by,kw,kh,label)=>{
+    kw=kw||KW;kh=kh||KH;
+    ctx.fillStyle="rgba(6,14,28,0.9)";rr(bx+1,by+3,kw,kh,KR);ctx.fill();
+    ctx.fillStyle="rgba(18,38,68,0.97)";ctx.strokeStyle="#3a80d8";ctx.lineWidth=1.8;
+    rr(bx,by,kw,kh,KR);ctx.fill();ctx.stroke();
+    ctx.strokeStyle="rgba(100,165,235,0.18)";ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(bx+KR,by+2);ctx.lineTo(bx+kw-KR,by+2);ctx.stroke();
+    const fs=label.length>3?9:label.length>2?10:13;
+    ctx.font=`bold ${fs}px monospace`;ctx.fillStyle="#88c8f8";ctx.textAlign="center";
+    ctx.fillText(label,bx+kw/2,by+kh*0.64);
+  };
+  const L=(bx,by,txt,col)=>{
+    ctx.font="11px sans-serif";ctx.fillStyle=col||"#4a7a98";
+    ctx.textAlign="left";ctx.fillText(txt,bx,by);
+  };
+  // MOVEMENT
+  const ox=px+28,oy=py+68;
+  ctx.font="bold 9px monospace";ctx.fillStyle="#22547a";ctx.textAlign="left";
+  ctx.fillText("이 동 / 구 르 기",ox,oy-10);
+  K(ox+KW+KG,      oy,           KW,KH,"W");
+  K(ox,             oy+KH+KG,     KW,KH,"A");
+  K(ox+KW+KG,      oy+KH+KG,     KW,KH,"S");
+  K(ox+(KW+KG)*2,  oy+KH+KG,     KW,KH,"D");
+  L(ox+(KW+KG)*3+6,oy+KH+KG+Math.round(KH*0.62),"이동","#4a88b8");
+  K(ox, oy+(KH+KG)*2, KW+KG+Math.round(KW*0.6),KH,"Shift");
+  L(ox+KW+KG+Math.round(KW*0.6)+8, oy+(KH+KG)*2+Math.round(KH*0.62),"걷기","#4a88b8");
+  K(ox, oy+(KH+KG)*3, KW*3+KG*2,KH,"Space");
+  L(ox+KW*3+KG*2+8, oy+(KH+KG)*3+Math.round(KH*0.62),"구르기","#4a88b8");
+  // COMBAT
+  const cx2=px+246,cy2=py+68;
+  ctx.font="bold 9px monospace";ctx.fillStyle="#22547a";ctx.textAlign="left";
+  ctx.fillText("전 투 / 기 타",cx2,cy2-10);
+  K(cx2,cy2,           KW,KH,"Q"); L(cx2+KW+7,cy2+Math.round(KH*0.62),"무기 교체","#4a88b8");
+  K(cx2,cy2+KH+KG,     KW,KH,"R"); L(cx2+KW+7,cy2+KH+KG+Math.round(KH*0.62),"재장전","#4a88b8");
+  K(cx2,cy2+(KH+KG)*2, KW,KH,"G"); L(cx2+KW+7,cy2+(KH+KG)*2+Math.round(KH*0.62),"무기 버리기","#4a88b8");
+  K(cx2,cy2+(KH+KG)*3, Math.round(KW*1.7),KH,"ESC");
+  L(cx2+Math.round(KW*1.7)+7,cy2+(KH+KG)*3+Math.round(KH*0.62),"일시정지","#4a88b8");
+  // MOUSE
+  const mox=px+pw-148,moy=py+68;
+  const mbw=60,mbh=84,mbr=18;
+  ctx.font="bold 9px monospace";ctx.fillStyle="#22547a";ctx.textAlign="left";
+  ctx.fillText("마 우 스",mox,moy-10);
+  ctx.fillStyle="rgba(8,16,30,0.97)";ctx.strokeStyle="#182e4a";ctx.lineWidth=1.5;
+  rr(mox,moy,mbw,mbh,mbr);ctx.fill();ctx.stroke();
+  ctx.save();ctx.beginPath();rr(mox,moy,mbw,mbh,mbr);ctx.clip();
+  ctx.fillStyle="rgba(28,70,160,0.48)";ctx.fillRect(mox,moy,mbw/2,mbh*0.45);
+  ctx.fillStyle="rgba(15,44,90,0.28)";ctx.fillRect(mox+mbw/2,moy,mbw/2,mbh*0.45);
+  ctx.restore();
+  ctx.strokeStyle="#4a90ee";ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(mox+mbw/2,moy+3);ctx.lineTo(mox+mbr,moy+3);
+  ctx.arcTo(mox+3,moy+3,mox+3,moy+mbr,mbr-3);
+  ctx.lineTo(mox+3,moy+mbh*0.44);ctx.lineTo(mox+mbw/2,moy+mbh*0.44);ctx.stroke();
+  ctx.strokeStyle="#2a5888";ctx.lineWidth=1.5;
+  ctx.beginPath();ctx.moveTo(mox+mbw/2,moy+3);ctx.lineTo(mox+mbw-mbr,moy+3);
+  ctx.arcTo(mox+mbw-3,moy+3,mox+mbw-3,moy+mbr,mbr-3);
+  ctx.lineTo(mox+mbw-3,moy+mbh*0.44);ctx.lineTo(mox+mbw/2,moy+mbh*0.44);ctx.stroke();
+  ctx.strokeStyle="rgba(10,22,44,0.9)";ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(mox+mbw/2,moy+3);ctx.lineTo(mox+mbw/2,moy+mbh*0.43);ctx.stroke();
+  ctx.fillStyle="rgba(14,28,52,0.97)";ctx.strokeStyle="#162a44";ctx.lineWidth=1;
+  rr(mox+mbw/2-5,moy+Math.round(mbh*0.13),10,18,3);ctx.fill();ctx.stroke();
+  ctx.font="bold 10px monospace";ctx.textAlign="center";
+  ctx.fillStyle="#78bcf0";ctx.fillText("L",mox+mbw*0.27,moy+Math.round(mbh*0.26));
+  ctx.fillStyle="#3a6898";ctx.fillText("R",mox+mbw*0.73,moy+Math.round(mbh*0.26));
+  L(mox,moy+mbh+16,"좌클릭  사격","#68b8f0");
+  L(mox,moy+mbh+32,"우클릭  집중사격","#3a88c8");
+  L(mox,moy+mbh+48,"      ↑칼: 찌르기","#2a6898");
+  ctx.font="10px sans-serif";ctx.fillStyle="#2a5070";ctx.textAlign="center";
+  ctx.fillText("칼 장비: 좌클릭 = 베기(레이더)   |   우클릭 = 찌르기   |   구르기 = 베기 공격",W/2,py+ph-46);
+  ctx.font="11px sans-serif";ctx.fillStyle="rgba(45,75,100,0.9)";
+  ctx.fillText("ESC 또는 클릭하면 닫힙니다",W/2,py+ph-22);
+  ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,4,0,TAU);ctx.fill();
+  ctx.fillStyle="#0af";ctx.beginPath();ctx.arc(mouse.x,mouse.y,2,0,TAU);ctx.fill();
 }
 
 function renderMenu(){
@@ -2031,7 +2122,13 @@ function renderMenu(){
     ctx.textAlign="center";
   });
 
-  drawKeyGuide(W/2-240,H/2+196,480);
+  const kgbw=130,kgbh=30,kgbx=W/2-kgbw/2,kgby=H/2+196;
+  const kgHov=mouse.x>=kgbx&&mouse.x<=kgbx+kgbw&&mouse.y>=kgby&&mouse.y<=kgby+kgbh;
+  ctx.fillStyle=kgHov?"rgba(20,55,95,0.92)":"rgba(10,28,52,0.82)";
+  ctx.strokeStyle=kgHov?"#4a8aca":"#1e4060";ctx.lineWidth=1.5;
+  rr(kgbx,kgby,kgbw,kgbh,6);ctx.fill();ctx.stroke();
+  ctx.font="bold 11px monospace";ctx.fillStyle=kgHov?"#88d8ff":"#3a88cc";
+  ctx.textAlign="center";ctx.fillText("⌨  키 안내",W/2,kgby+kgbh*0.65);
   ctx.font="11px sans-serif";ctx.fillStyle="rgba(60,80,100,0.7)";
   ctx.fillText("© BLOCK WAR ALPHA  —  eser.lbs@gmail.com",W/2,H-16);
   ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,3,0,TAU);ctx.fill();
@@ -2042,41 +2139,38 @@ function renderPause(){
   ctx.fillStyle="rgba(0,0,0,0.72)";
   ctx.fillRect(0,0,W,H);
   // 패널
-  const pw=440,ph=230,px=W/2-pw/2,py=H/2-ph/2;
+  const pw=380,ph=290,px=W/2-pw/2,py=H/2-ph/2;
   ctx.fillStyle="rgba(10,16,24,0.97)";
   ctx.strokeStyle="#2a3e56";ctx.lineWidth=1.5;
   rr(px,py,pw,ph,12);ctx.fill();ctx.stroke();
-  // 상단 강조선
   ctx.fillStyle="#2a5a8a";
   rr(px+1,py+1,pw-2,4,2);ctx.fill();
-  // 제목
   ctx.textAlign="center";
   ctx.font="bold 22px monospace";ctx.fillStyle="#8ab8d8";
   ctx.fillText("일시 정지",W/2,py+50);
-  // 구분선
   ctx.strokeStyle="rgba(60,90,120,0.4)";ctx.lineWidth=1;
   ctx.beginPath();ctx.moveTo(px+30,py+66);ctx.lineTo(px+pw-30,py+66);ctx.stroke();
-  // 계속하기 버튼
-  const bw=280,bx2=W/2-bw/2;
-  const hov1=mouse.x>=bx2&&mouse.x<=bx2+bw&&mouse.y>=H/2-10&&mouse.y<=H/2+40;
-  const hov2=mouse.x>=bx2&&mouse.x<=bx2+bw&&mouse.y>=H/2+54&&mouse.y<=H/2+104;
+  const bw=260,bx2=W/2-bw/2;
+  const hov1=mouse.x>=bx2&&mouse.x<=bx2+bw&&mouse.y>=H/2-20&&mouse.y<=H/2+26;
+  const hov2=mouse.x>=bx2&&mouse.x<=bx2+bw&&mouse.y>=H/2+38&&mouse.y<=H/2+84;
+  const hov3=mouse.x>=bx2&&mouse.x<=bx2+bw&&mouse.y>=H/2+96&&mouse.y<=H/2+130;
   ctx.fillStyle=hov1?"rgba(30,70,110,0.95)":"rgba(20,50,80,0.9)";
   ctx.strokeStyle=hov1?"#4a8aca":"#2a6aaa";ctx.lineWidth=1.5;
-  rr(bx2,H/2-10,bw,50,8);ctx.fill();ctx.stroke();
-  ctx.font="bold 16px monospace";ctx.fillStyle=hov1?"#aadeff":"#6ab4e8";
-  ctx.fillText("계속하기",W/2,H/2+20);
-  // 메인메뉴 버튼
+  rr(bx2,H/2-20,bw,46,8);ctx.fill();ctx.stroke();
+  ctx.font="bold 15px monospace";ctx.fillStyle=hov1?"#aadeff":"#6ab4e8";
+  ctx.fillText("계속하기",W/2,H/2+10);
   ctx.fillStyle=hov2?"rgba(60,25,25,0.95)":"rgba(30,20,20,0.9)";
   ctx.strokeStyle=hov2?"#8a3a3a":"#5a2a2a";ctx.lineWidth=1.5;
-  rr(bx2,H/2+54,bw,50,8);ctx.fill();ctx.stroke();
-  ctx.font="bold 16px monospace";ctx.fillStyle=hov2?"#e08080":"#c06060";
-  ctx.fillText("← 메인 메뉴",W/2,H/2+84);
-  // ESC 힌트
+  rr(bx2,H/2+38,bw,46,8);ctx.fill();ctx.stroke();
+  ctx.font="bold 15px monospace";ctx.fillStyle=hov2?"#e08080":"#c06060";
+  ctx.fillText("← 메인 메뉴",W/2,H/2+68);
+  ctx.fillStyle=hov3?"rgba(20,55,95,0.92)":"rgba(10,28,52,0.82)";
+  ctx.strokeStyle=hov3?"#4a8aca":"#1e4060";ctx.lineWidth=1.5;
+  rr(bx2,H/2+96,bw,34,8);ctx.fill();ctx.stroke();
+  ctx.font="bold 12px monospace";ctx.fillStyle=hov3?"#88d8ff":"#3a88cc";
+  ctx.fillText("⌨  키 안내",W/2,H/2+118);
   ctx.font="11px sans-serif";ctx.fillStyle="rgba(80,100,120,0.7)";
   ctx.fillText("ESC — 계속하기",W/2,py+ph-14);
-  // 키 안내
-  drawKeyGuide(W/2-210,H/2+128,420);
-  // 커서 표시 (게임중 커서 숨겨지므로 명시적으로 렌더)
   ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,4,0,TAU);ctx.fill();
   ctx.fillStyle="#0af";ctx.beginPath();ctx.arc(mouse.x,mouse.y,2,0,TAU);ctx.fill();
 }
