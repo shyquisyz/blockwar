@@ -77,6 +77,7 @@ let lobbyInput = "";
 let lobbyInputMode = false;
 let netSendTimer = 0;
 let showKeyGuide = false;
+let buyMenuOpen = false;
 
 /* ---------------- 유틸 ---------------- */
 const clamp = (v,a,b)=>v<a?a:(v>b?b:v);
@@ -106,79 +107,74 @@ addEventListener("resize",resize); resize();
 /* ---------------- 맵 — Dust2 Flat (탑뷰 단순화) ---------------- */
 const WORLD = CONFIG.world;
 const walls = [
-  // ── 외곽 경계 ──
+  // ── 외곽 ──
   {x:0,   y:0,    w:1800,h:30},
   {x:0,   y:1170, w:1800,h:30},
   {x:0,   y:0,    w:30,  h:1200},
   {x:1770,y:0,    w:30,  h:1200},
 
-  // ── LONG A (상단 복도, T → A사이트) ──
-  {x:30,  y:30,   w:720,h:110},  // 복도 북벽
-  {x:200, y:230,  w:540,h:80},   // 복도 남벽
-  {x:740, y:30,   w:30, h:280},  // A사이트 진입 코너
-
-  // ── SHORT A / MID UPPER ──
-  {x:740, y:340,  w:30, h:200},  // Short-A 좌벽
-  {x:760, y:340,  w:180,h:30},   // Short-A 상단 가로벽
+  // ── LONG A (상단 복도) ── T스폰 → A사이트
+  {x:30,  y:30,   w:730, h:110},  // Long A 북벽
+  {x:180, y:230,  w:560, h:80},   // Long A 남벽 (복도 y:140~230)
+  {x:740, y:30,   w:40,  h:270},  // A사이트 진입 코너 기둥
 
   // ── A 사이트 ──
-  {x:900, y:30,   w:160,h:140},  // A 사이트 CT 진입 대형 박스
-  {x:1100,y:30,   w:380,h:50},   // CT 연결 상단 벽
-  {x:1050,y:200,  w:120,h:110},  // A 사이트 중앙 박스
-  {x:1230,y:160,  w:70, h:150},  // A 사이트 코너 박스
+  {x:880, y:30,   w:160, h:140},  // A site 대형 박스(좌)
+  {x:1080,y:30,   w:90,  h:110},  // A site 박스(우)
+  {x:1040,y:200,  w:140, h:100},  // A site 중앙 박스
+  {x:1250,y:140,  w:80,  h:150},  // A site 코너 박스
 
-  // ── CT 스폰 구역 ──
-  {x:1480,y:30,   w:290,h:100},  // CT 진입 상단 벽
-  {x:1560,y:130,  w:30, h:290},  // CT 구역 좌벽
-  {x:1480,y:420,  w:290,h:30},   // CT 구역 하단 벽
-  {x:1620,y:450,  w:60, h:60},   // CT 사이트 방어 박스
+  // ── CT 영역 (봉쇄 없음) ── CT스폰은 개방형
+  {x:1650,y:30,   w:120, h:90},   // CT 후방 상단 박스
+  {x:1500,y:30,   w:80,  h:180},  // CT → A 통로 기둥
+  {x:1610,y:310,  w:160, h:55},   // CT 앞 엄폐 박스
+  {x:1430,y:430,  w:70,  h:70},   // CT 중앙 박스
 
-  // ── MID (중앙) ──
-  {x:680, y:450,  w:30, h:160},  // 미드 T 좌벽
-  {x:710, y:450,  w:160,h:30},   // 미드 윗 횡단 벽
-  {x:710, y:610,  w:160,h:30},   // 미드 아래 횡단 벽
-  {x:870, y:480,  w:100,h:130},  // 미드 중앙 필라
+  // ── MID ──
+  {x:660, y:440,  w:40,  h:180},  // Mid T쪽 좌벽
+  {x:700, y:440,  w:190, h:40},   // Mid 상단 가로벽
+  {x:700, y:620,  w:190, h:40},   // Mid 하단 가로벽
+  {x:890, y:480,  w:110, h:130},  // Mid 중앙 필라
+  {x:1280,y:490,  w:70,  h:70},   // CT mid 박스
 
   // ── B 터널 (하단) ──
-  {x:200, y:730,  w:620,h:70},   // 터널 북벽
-  {x:200, y:1090, w:620,h:50},   // 터널 남벽
-  {x:480, y:800,  w:30, h:160},  // 터널 내부 분리벽
+  {x:180, y:730,  w:650, h:80},   // 터널 북벽
+  {x:180, y:1090, w:650, h:50},   // 터널 남벽
+  {x:480, y:810,  w:40,  h:150},  // 터널 내부 분리벽
 
   // ── B 사이트 ──
-  {x:960, y:800,  w:140,h:110},  // B 사이트 메인 박스
-  {x:1140,y:860,  w:110,h:110},  // B 사이트 코너 박스
-  {x:1300,y:780,  w:80, h:150},  // B CT 진입 박스
-  {x:1420,y:780,  w:280,h:30},   // B CT 상단 벽
-
-  // ── CT → B 통로 ──
-  {x:1560,y:420,  w:30, h:360},  // CT 구역 우측 통로 벽
+  {x:960, y:810,  w:140, h:110},  // B site 메인 박스
+  {x:1160,y:870,  w:110, h:110},  // B site 코너 박스
+  {x:1380,y:790,  w:80,  h:150},  // B CT진입 박스
+  {x:1530,y:600,  w:50,  h:200},  // CT → B 통로 분리벽 (끊어진 벽)
 
   // ── 산개 엄폐물 ──
-  {x:360, y:380,  w:65, h:65},   // T 중앙 박스1
-  {x:360, y:1010, w:65, h:65},   // T 하단 박스
-  {x:800, y:940,  w:65, h:65},   // B 입구 박스
-  {x:1380,y:530,  w:70, h:70},   // CT 미드 박스
-  {x:620, y:700,  w:55, h:55},   // 미드 하단 박스
+  {x:350, y:380,  w:65,  h:65},
+  {x:350, y:980,  w:65,  h:65},
+  {x:820, y:930,  w:65,  h:65},
+  {x:610, y:700,  w:55,  h:55},
 ];
-// 봇 순찰 지점 (Dust2 구조 반영)
+// 봇 순찰 지점
 const waypoints = [
-  {x:100, y:600},  // T spawn
-  {x:320, y:150},  // Long A T side
-  {x:600, y:150},  // Long A entrance
-  {x:980, y:150},  // A site
-  {x:1350,y:300},  // CT → A
-  {x:1680,y:280},  // CT spawn
-  {x:1680,y:600},  // CT mid
-  {x:1350,y:900},  // CT → B
-  {x:1100,y:950},  // B site
-  {x:700, y:900},  // B tunnel exit
-  {x:350, y:900},  // B tunnel T side
-  {x:100, y:800},  // T lower spawn
-  {x:760, y:560},  // Mid
+  {x:100, y:620},  // T spawn
+  {x:300, y:160},  // Long A T side
+  {x:600, y:160},  // Long A mid
+  {x:870, y:160},  // A site entrance
+  {x:1120,y:300},  // A site
+  {x:1500,y:230},  // CT A side
+  {x:1680,y:420},  // CT spawn
+  {x:1600,y:650},  // CT mid
+  {x:1400,y:920},  // CT B side
+  {x:1100,y:960},  // B site
+  {x:800, y:960},  // B entrance
+  {x:500, y:900},  // B tunnel
+  {x:250, y:900},  // B tunnel T
+  {x:100, y:800},  // T lower
+  {x:800, y:540},  // Mid center
 ];
 const spawns = {
-  0:[{x:95,y:570},{x:95,y:670},{x:95,y:770}],    // T (좌측)
-  1:[{x:1690,y:200},{x:1690,y:280},{x:1690,y:360}] // CT (우상)
+  0:[{x:95, y:580},{x:95, y:680},{x:95, y:780}],    // T (좌측)
+  1:[{x:1670,y:420},{x:1670,y:520},{x:1670,y:620}]  // CT (우측, 개방형)
 };
 
 /* ---------------- 레이캐스트 ---------------- */
@@ -635,7 +631,11 @@ addEventListener("keydown",ev=>{
   if(ev.code==="Space")ev.preventDefault();
   if(ev.code==="F1"){ev.preventDefault();CONFIG.debug=!CONFIG.debug;}
   if(gameState==="menu"||gameState==="title"||gameState==="paused")return;
-  if(ev.code==="Escape"&&gameState==="game"){gameState="paused";scoped=false;return;}
+  if(ev.code==="Escape"&&gameState==="game"){gameState="paused";scoped=false;buyMenuOpen=false;return;}
+  if(ev.code==="KeyB"&&gameState==="game"&&player&&(round.state==="pre"||round.state==="play")){
+    buyMenuOpen=!buyMenuOpen;return;
+  }
+  if(buyMenuOpen)return;
   if(!player||!player.alive||round.state!=="play")return;
   if(ev.code==="KeyR")startReload(player);
   if(ev.code==="Digit1"){if(player.ammo[chosenWeapon])switchWeapon(player,chosenWeapon);}
@@ -662,6 +662,17 @@ function inBtn(bx,by,bw,bh){return mouse.x>=bx&&mouse.x<=bx+bw&&mouse.y>=by&&mou
 addEventListener("mousedown",ev=>{
   audioInit();
   if(showKeyGuide){showKeyGuide=false;return;}
+  if(buyMenuOpen){
+    const pw=520,ph=360,px=W/2-pw/2,py=H/2-ph/2;
+    BUY_ITEMS.forEach((item,i)=>{
+      const ix=px+20+(i%3)*(pw/3-4),iy=py+80+Math.floor(i/3)*120;
+      const iw=pw/3-14,ih=100;
+      if(inBtn(ix,iy,iw,ih))doBuy(item);
+    });
+    // 패널 바깥 클릭 시 닫기
+    if(!inBtn(px,py,pw,ph))buyMenuOpen=false;
+    return;
+  }
   if(gameState==="lobby"){
     // 무기 선택 버튼 (항상 클릭 가능)
     [{key:"ak"},{key:"smg"},{key:"awp"}].forEach((wc,i)=>{
@@ -778,9 +789,11 @@ function updatePlayer(dt,now){
   if(roll.chainWin>0)roll.chainWin=Math.max(0,roll.chainWin-dt);
   // 구르기 시작
   if(keys.Space&&!roll.active&&roll.cd<=0){
-    let cd=CONFIG.roll.cooldown;
+    const isKnife=p.weaponKey==='knife';
+    let cd=isKnife?3.5:CONFIG.roll.cooldown;
+    const minCd=isKnife?3.0:CONFIG.roll.minCd;
     if(roll.chainWin>0){
-      cd=Math.max(CONFIG.roll.minCd,cd*(1-CONFIG.roll.chainCut));
+      cd=Math.max(minCd,cd*(1-CONFIG.roll.chainCut));
       floatTexts.push({wx:p.x,wy:p.y-32,t:0,life:0.9,vy:-28,text:"RHYTHM",color:"#88ffcc",size:12});
     }
     roll.active=true;roll.t=0;roll.cd=cd;roll.chainWin=0;
@@ -1030,6 +1043,7 @@ let menuModeIdx=0;
 addEventListener("keydown",ev=>{
   if(ev.code==="Space")ev.preventDefault();
   if(showKeyGuide){if(ev.code==="Escape"){showKeyGuide=false;ev.stopPropagation();}return;}
+  if(buyMenuOpen){if(ev.code==="Escape"||ev.code==="KeyB"){buyMenuOpen=false;}return;}
   if(gameState==="lobby"){
     if(lobbyInputMode){
       if(ev.code==="Backspace"){lobbyInput=lobbyInput.slice(0,-1);}
@@ -1525,6 +1539,7 @@ function render(){
   }
 
   renderHUD();
+  if(buyMenuOpen)renderBuyMenu();
   if(gameState==="paused")renderPause();
   if(showKeyGuide)renderKeyGuide();
 }
@@ -1884,7 +1899,11 @@ function renderHUD(){
     ctx.strokeRect(0,H/2-55,W,110);
     ctx.font="bold 44px monospace";ctx.textAlign="center";
     ctx.fillStyle="#dde4ec";
-    ctx.fillText(`ROUND  ${round.n}`,W/2,H/2+16);
+    ctx.fillText(`ROUND  ${round.n}`,W/2,H/2+10);
+    if(player){
+      ctx.font="12px monospace";ctx.fillStyle="rgba(180,200,160,0.7)";
+      ctx.fillText(`$ ${player.money}   |   B — 무기 구매`,W/2,H/2+38);
+    }
   }else if(round.state==="end"){
     const win=round.msg.includes("승리");
     ctx.fillStyle="rgba(0,0,0,0.65)";ctx.fillRect(0,H/2-65,W,130);
@@ -1902,6 +1921,71 @@ function renderHUD(){
   // ══════════════════════════════════════════
   ctx.textAlign="left";ctx.font="10px monospace";ctx.fillStyle="rgba(120,140,160,0.4)";
   ctx.fillText("WASD · Shift · Space · 우클릭 · R · 1/2/3 · F1",24,H-8);
+}
+
+const BUY_ITEMS=[
+  {key:"knife",  name:"칼",    price:0,   desc:"빠른 이동  |  구르기 CD 3.5s",   col:"#88aacc"},
+  {key:"smg",    name:"SMG",   price:300, desc:"빠른 연사  |  단거리 특화",       col:"#7acc88"},
+  {key:"ak",     name:"AK-47", price:400, desc:"균형형     |  중거리 표준",       col:"#ccaa44"},
+  {key:"awp",    name:"AWP",   price:500, desc:"원샷 처치  |  느린 이동",         col:"#88aaff"},
+  {key:"pistol", name:"권총",  price:0,   desc:"보조 무기  |  항상 소지",         col:"#aaaaaa"},
+];
+function renderBuyMenu(){
+  if(!player)return;
+  const pw=520,ph=360,px=W/2-pw/2,py=H/2-ph/2;
+  ctx.fillStyle="rgba(0,0,0,0.82)";ctx.fillRect(0,0,W,H);
+  ctx.fillStyle="rgba(6,14,24,0.98)";ctx.strokeStyle="#1e3a54";ctx.lineWidth=2;
+  rr(px,py,pw,ph,14);ctx.fill();ctx.stroke();
+  ctx.fillStyle="#1a4a6a";rr(px+1,py+1,pw-2,5,3);ctx.fill();
+  ctx.textAlign="center";
+  ctx.font="bold 18px monospace";ctx.fillStyle="#68b8ec";
+  ctx.fillText("무기 구매",W/2,py+34);
+  ctx.font="11px monospace";ctx.fillStyle="rgba(180,200,160,0.9)";
+  ctx.fillText(`보유 자금  $ ${player.money}`,W/2,py+56);
+  ctx.strokeStyle="rgba(30,60,100,0.4)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(px+24,py+68);ctx.lineTo(px+pw-24,py+68);ctx.stroke();
+  BUY_ITEMS.forEach((item,i)=>{
+    const ix=px+20+(i%3)*(pw/3-4), iy=py+80+Math.floor(i/3)*120;
+    const iw=pw/3-14, ih=100;
+    const canAfford=player.money>=item.price;
+    const isEquipped=player.weaponKey===item.key||(item.key==="pistol"&&player.ammo?.pistol);
+    const hov=inBtn(ix,iy,iw,ih);
+    ctx.fillStyle=hov&&canAfford?"rgba(20,50,85,0.95)":"rgba(10,22,38,0.9)";
+    ctx.strokeStyle=canAfford?(hov?item.col:`${item.col}88`):`${item.col}33`;
+    ctx.lineWidth=hov&&canAfford?2:1;
+    rr(ix,iy,iw,ih,8);ctx.fill();ctx.stroke();
+    if(isEquipped){
+      ctx.fillStyle=`${item.col}22`;rr(ix+1,iy+1,iw-2,ih-2,7);ctx.fill();
+      ctx.font="bold 8px monospace";ctx.fillStyle=item.col;ctx.textAlign="right";
+      ctx.fillText("장착중",ix+iw-8,iy+14);
+    }
+    ctx.textAlign="center";
+    ctx.font=`bold 15px monospace`;ctx.fillStyle=canAfford?item.col:`${item.col}55`;
+    ctx.fillText(item.name,ix+iw/2,iy+28);
+    ctx.font="9px sans-serif";ctx.fillStyle=canAfford?"rgba(170,190,210,0.8)":"rgba(100,110,120,0.5)";
+    const lines=item.desc.split("|");
+    lines.forEach((l,li)=>ctx.fillText(l.trim(),ix+iw/2,iy+44+li*14));
+    ctx.font="bold 13px monospace";
+    ctx.fillStyle=item.price===0?"rgba(100,150,100,0.7)":(canAfford?"#c8e870":"#885555");
+    ctx.fillText(item.price===0?"FREE":`$${item.price}`,ix+iw/2,iy+ih-12);
+  });
+  ctx.font="11px sans-serif";ctx.fillStyle="rgba(80,100,120,0.7)";ctx.textAlign="center";
+  ctx.fillText("B 또는 ESC로 닫기",W/2,py+ph-12);
+  ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,4,0,TAU);ctx.fill();
+  ctx.fillStyle="#0af";ctx.beginPath();ctx.arc(mouse.x,mouse.y,2,0,TAU);ctx.fill();
+}
+function doBuy(item){
+  if(!player)return;
+  if(player.money<item.price)return;
+  if(item.price>0)player.money-=item.price;
+  if(item.key==='pistol'||item.key==='knife')return; // 항상 소지
+  // 무기 전환 + 탄약 설정
+  const wp=CONFIG.weapons[item.key];
+  if(!player.ammo[item.key])player.ammo[item.key]={mag:wp.mag,reserve:wp.reserve};
+  chosenWeapon=item.key;
+  switchWeapon(player,item.key);
+  buyMenuOpen=false;
+  addFeed(`${item.name} 구매 (-$${item.price})`);
 }
 
 function renderResult(){
