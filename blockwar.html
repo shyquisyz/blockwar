@@ -75,6 +75,7 @@ let lobbyCode = "";
 let lobbyInput = "";
 let lobbyInputMode = false;
 let netSendTimer = 0;
+let _dbgStateSend = 0, _dbgStateRecv = 0;
 
 /* ---------------- 유틸 ---------------- */
 const clamp = (v,a,b)=>v<a?a:(v>b?b:v);
@@ -413,6 +414,7 @@ function fireHitscan(shooter,wp,ang){
     const dmg=head?wp.dmg*wp.headMult:wp.dmg;
     // 온라인: 원격 플레이어 피격 → 이벤트 전송
     if(best.e===remoteEntity&&ws&&ws.readyState===1){
+      console.log('[NET] HIT SEND dmg='+dmg+' head='+head);
       ws.send(JSON.stringify({type:'hit',dmg,head}));
     }else{
       applyDamage(best.e,dmg,head,shooter);
@@ -429,6 +431,7 @@ function fireHitscan(shooter,wp,ang){
   flashes.push({x:ox,y:oy,ang,t:0.05});
   // 온라인: 발사 시각 효과 전송 (상대방 화면에서 트레이서/사운드)
   if(shooter===player&&ws&&ws.readyState===1){
+    console.log('[NET] SHOT SEND wk='+shooter.weaponKey);
     ws.send(JSON.stringify({type:'shot',wk:shooter.weaponKey,ox:Math.round(ox),oy:Math.round(oy),ex:Math.round(ex),ey:Math.round(ey)}));
   }
 }
@@ -1659,7 +1662,7 @@ function connectToServer(){
   netState="connecting";
   try{
     ws=new WebSocket(SERVER_URL);
-    ws.onopen=()=>{netState="lobby";_startHB();};
+    ws.onopen=()=>{netState="lobby";_startHB();console.log('[NET] CONNECTED to',SERVER_URL);};
     ws.onerror=()=>{netState="error";};
     ws.onclose=()=>{
       _stopHB();
@@ -1673,12 +1676,12 @@ function connectToServer(){
 function handleNetMessage(ev){
   let msg;try{msg=JSON.parse(ev.data);}catch{return;}
   switch(msg.type){
-    case 'created': lobbyCode=msg.code; netState="waiting"; break;
+    case 'created': lobbyCode=msg.code; netState="waiting"; console.log('[NET] ROOM JOINED code='+msg.code); break;
     case 'joined':  netState="waiting"; break;
-    case 'start':   mySlot=msg.yourSlot; round.n=0; round.scores=[0,0]; startOnlineGame(); break;
-    case 'state':   if(remoteEntity)updateRemoteEntity(msg); break;
-    case 'hit':     if(player&&player.alive)applyDamage(player,msg.dmg,msg.head,remoteEntity); break;
-    case 'shot':    handleRemoteShot(msg); break;
+    case 'start':   mySlot=msg.yourSlot; round.n=0; round.scores=[0,0]; console.log('[NET] GAME STARTED slot='+msg.yourSlot); startOnlineGame(); break;
+    case 'state':   _dbgStateRecv++;if(_dbgStateRecv%100===1)console.log('[NET] STATE RECEIVE ×'+_dbgStateRecv+' x='+msg.x+' y='+msg.y+' hp='+msg.hp);if(remoteEntity)updateRemoteEntity(msg); break;
+    case 'hit':     console.log('[NET] HIT RECEIVE dmg='+msg.dmg+' head='+msg.head);if(player&&player.alive)applyDamage(player,msg.dmg,msg.head,remoteEntity); break;
+    case 'shot':    console.log('[NET] SHOT RECEIVE wk='+msg.wk);handleRemoteShot(msg); break;
     case 'restart': if(netState==="playing")startOnlineGame(); break;
     case 'pong':    break;
     case 'disconnect': addFeed("상대방 연결 끊김"); netState="disconnected"; break;
@@ -1722,6 +1725,8 @@ function startOnlineGame(){
 
 function sendPlayerState(){
   if(!ws||ws.readyState!==1||!player)return;
+  _dbgStateSend++;
+  if(_dbgStateSend%100===1)console.log('[NET] STATE SEND ×'+_dbgStateSend+' x='+Math.round(player.x)+' y='+Math.round(player.y)+' hp='+player.hp);
   ws.send(JSON.stringify({
     type:'state',
     x:Math.round(player.x),y:Math.round(player.y),
