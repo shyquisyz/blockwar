@@ -1,0 +1,2010 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BLOCK WAR — MVP</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0d10;overflow:hidden}
+  canvas{display:block;cursor:none}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+/* =====================================================================
+   BLOCK WAR — 탑뷰 전술 슈터 MVP (재미 검증용 프로토타입)
+   - 3 vs 3 (플레이어 + 아군 봇 2 vs 적 봇 3)
+   - Cone 시야 / 사운드 플레이 / 히트스캔 / 헤드샷 / FSM AI / 라운드
+   - 모든 수치는 아래 CONFIG에서 조정 (Inspector 대용)
+   ===================================================================== */
+
+const TAU = Math.PI * 2;
+const RAD = Math.PI / 180;
+
+/* ---------------- CONFIG (Inspector 대용) ---------------- */
+const CONFIG = {
+  player: { speed: 235, walkMult: 0.5, hp: 100, radius: 13, headRadius: 5.5 },
+  roll:   { dist: 150, time: 0.3, cooldown: 5.0, fireLock: 0.3, noise: 340 },
+  focus:  { spreadMult: 0.35, speedMult: 0.5 },          // 우클릭 집중 사격
+  vision: { fov: 100 * RAD, dist: 470, closeR: 75, rays: 54, fogAlpha: 0.92 },
+  bot: {
+    speed: 205, fov: 100 * RAD, dist: 410,
+    reactMin: 0.28, reactMax: 0.55,                       // 발견 후 첫 발사까지
+    aimErr: 0.20,                                         // 조준 오차(라디안)
+    turnSpeed: 6.5,                                       // 회전 속도(라드/초)
+    burstMin: 3, burstMax: 6, burstPauseMin: 0.45, burstPauseMax: 0.9,
+    searchTime: 3.5, investigateLook: 1.8
+  },
+  noise: { walk: 70, run: 210, stepEveryPx: 85, reload: 240 },
+  weapons: {
+    ak:     { name:"AK-47", slot:1, auto:true,  rpm:600, mag:30, reserve:90,
+              dmg:30, headMult:3.6, spread:0.034, moveSpread:0.05,
+              recoil:0.012, recoilMax:0.085, recoilDecay:0.22,
+              reloadTime:2.0, noise:680, range:950, speedMult:1.0, rollMult:1.0 },
+    smg:    { name:"SMG",   slot:1, auto:true,  rpm:900, mag:25, reserve:100,
+              dmg:18, headMult:3.0, spread:0.048, moveSpread:0.055,
+              recoil:0.008, recoilMax:0.06, recoilDecay:0.38,
+              reloadTime:1.8, noise:580, range:600, speedMult:1.12, rollMult:1.0 },
+    awp:    { name:"AWP",   slot:1, auto:false, rpm:40,  mag:5,  reserve:20,
+              dmg:95, headMult:1.1, spread:0.004, moveSpread:0.14,
+              recoil:0.0, recoilMax:0.0, recoilDecay:0.5,
+              reloadTime:3.6, noise:960, range:1800, speedMult:0.58,
+              scopeFov:26*RAD, scopeDist:1600, rollMult:0.52 },
+    pistol: { name:"권총", slot:2, auto:false, rpm:420, mag:12, reserve:36,
+              dmg:22, headMult:3.2, spread:0.018, moveSpread:0.04,
+              recoil:0.014, recoilMax:0.05, recoilDecay:0.3,
+              reloadTime:1.4, noise:540, range:850, speedMult:1.05, rollMult:0.9 },
+    knife:  { name:"칼", slot:3, melee:true, rpm:130, dmg:55,
+              range:46, arc:90*RAD, noise:120, speedMult:1.22, rollMult:1.65 }
+  },
+  killEffect: { slowDur:0.22, slowScale:0.15 },   // 킬 순간 슬로모션
+  round: { preTime: 1.6, endTime: 2.8 },
+  world: { w: 1800, h: 1200 },
+  debug: false   // F1 토글: 봇 상태/시야 표시
+};
+
+/* ---------------- 네트워크 설정 ---------------- */
+const SERVER_URL = "wss://blockwar-relay.onrender.com";
+let ws = null;
+let mySlot = -1;         // -1=오프라인, 0=왼쪽, 1=오른쪽
+let remoteEntity = null;
+let netState = "idle";   // idle|connecting|lobby|waiting|playing|error|disconnected
+let lobbyCode = "";
+let lobbyInput = "";
+let lobbyInputMode = false;
+let netSendTimer = 0;
+
+/* ---------------- 유틸 ---------------- */
+const clamp = (v,a,b)=>v<a?a:(v>b?b:v);
+const lerp = (a,b,t)=>a+(b-a)*t;
+const dist2 = (ax,ay,bx,by)=>{const dx=bx-ax,dy=by-ay;return dx*dx+dy*dy;};
+const dist = (ax,ay,bx,by)=>Math.sqrt(dist2(ax,ay,bx,by));
+const rand = (a,b)=>a+Math.random()*(b-a);
+const randi = (a,b)=>Math.floor(rand(a,b+1));
+function angDiff(a,b){let d=(b-a)%TAU;if(d>Math.PI)d-=TAU;if(d<-Math.PI)d+=TAU;return d;}
+function turnToward(cur,target,maxStep){const d=angDiff(cur,target);return Math.abs(d)<=maxStep?target:cur+Math.sign(d)*maxStep;}
+
+/* ---------------- 캔버스 ---------------- */
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+const fog = document.createElement("canvas");
+const fctx = fog.getContext("2d");
+// AWP 스코프 — 게임 화면 캡처 후 확대용
+const scopeBuf = document.createElement("canvas");
+const sbctx = scopeBuf.getContext("2d");
+const SCOPE_R = 170;   // 스코프 원 반지름 (px)
+let scopeZoom = 3.2;   // 확대 배율 (휠로 조절)
+scopeBuf.width = scopeBuf.height = SCOPE_R * 2;
+let W=0,H=0;
+function resize(){W=cv.width=fog.width=innerWidth;H=cv.height=fog.height=innerHeight;}
+addEventListener("resize",resize); resize();
+
+/* ---------------- 맵 (벽 = AABB) ---------------- */
+const WORLD = CONFIG.world;
+const walls = [
+  // 외곽
+  {x:0,y:0,w:WORLD.w,h:30},{x:0,y:WORLD.h-30,w:WORLD.w,h:30},
+  {x:0,y:0,w:30,h:WORLD.h},{x:WORLD.w-30,y:0,w:30,h:WORLD.h},
+  // 건물
+  {x:250,y:150,w:300,h:200},
+  {x:700,y:100,w:180,h:350},
+  {x:1150,y:150,w:350,h:180},
+  {x:250,y:750,w:300,h:220},
+  {x:700,y:650,w:200,h:200},
+  {x:1200,y:720,w:320,h:230},
+  // 중앙/엄폐물
+  {x:560,y:430,w:70,h:70},
+  {x:860,y:520,w:90,h:90},
+  {x:1090,y:420,w:70,h:70},
+  {x:1000,y:200,w:60,h:120},
+  {x:480,y:980,w:120,h:60},
+  {x:1000,y:980,w:60,h:120},
+  {x:1450,y:430,w:60,h:140},
+  {x:150,y:430,w:60,h:140}
+];
+// 봇 순찰 지점
+const waypoints = [
+  {x:150,y:120},{x:630,y:80},{x:1650,y:110},{x:960,y:300},
+  {x:120,y:600},{x:640,y:560},{x:980,y:620},{x:1680,y:600},
+  {x:150,y:1080},{x:640,y:1080},{x:1000,y:920},{x:1650,y:1080}
+];
+const spawns = {
+  0:[{x:110,y:520},{x:110,y:600},{x:110,y:680}],   // 아군(좌측)
+  1:[{x:1690,y:520},{x:1690,y:600},{x:1690,y:680}] // 적(우측)
+};
+
+/* ---------------- 레이캐스트 ---------------- */
+function rayAABB(ox,oy,dx,dy,r){
+  let tmin=0,tmax=Infinity;
+  if(Math.abs(dx)<1e-9){ if(ox<r.x||ox>r.x+r.w)return Infinity; }
+  else{let t1=(r.x-ox)/dx,t2=(r.x+r.w-ox)/dx;if(t1>t2){const t=t1;t1=t2;t2=t;}
+    tmin=Math.max(tmin,t1);tmax=Math.min(tmax,t2);}
+  if(Math.abs(dy)<1e-9){ if(oy<r.y||oy>r.y+r.h)return Infinity; }
+  else{let t1=(r.y-oy)/dy,t2=(r.y+r.h-oy)/dy;if(t1>t2){const t=t1;t1=t2;t2=t;}
+    tmin=Math.max(tmin,t1);tmax=Math.min(tmax,t2);}
+  if(tmax<tmin)return Infinity;
+  return tmin>=0?tmin:Infinity;
+}
+function castRay(ox,oy,ang,max){
+  const dx=Math.cos(ang),dy=Math.sin(ang);
+  let t=max;
+  for(const r of walls){const h=rayAABB(ox,oy,dx,dy,r);if(h<t)t=h;}
+  return t;
+}
+function hasLOS(ax,ay,bx,by){
+  const d=dist(ax,ay,bx,by);
+  if(d<1)return true;
+  return castRay(ax,ay,Math.atan2(by-ay,bx-ax),d)>=d-0.5;
+}
+function circleRectHit(cx,cy,r,rc){
+  const px=clamp(cx,rc.x,rc.x+rc.w),py=clamp(cy,rc.y,rc.y+rc.h);
+  return dist2(cx,cy,px,py)<r*r;
+}
+function collides(x,y,r){
+  for(const w of walls)if(circleRectHit(x,y,r,w))return true;
+  return false;
+}
+function moveWithCollision(e,vx,vy,dt){
+  let nx=e.x+vx*dt;
+  if(!collides(nx,e.y,e.r))e.x=nx;
+  let ny=e.y+vy*dt;
+  if(!collides(e.x,ny,e.r))e.y=ny;
+}
+
+/* ---------------- A* 길찾기 ---------------- */
+const CELL=30, GW=Math.ceil(WORLD.w/CELL), GH=Math.ceil(WORLD.h/CELL);
+const blocked=new Uint8Array(GW*GH);
+(function buildGrid(){
+  const inflate=15;
+  for(let gy=0;gy<GH;gy++)for(let gx=0;gx<GW;gx++){
+    const cx=gx*CELL+CELL/2, cy=gy*CELL+CELL/2;
+    for(const w of walls){
+      if(cx>w.x-inflate&&cx<w.x+w.w+inflate&&cy>w.y-inflate&&cy<w.y+w.h+inflate){
+        blocked[gy*GW+gx]=1;break;
+      }
+    }
+  }
+})();
+function nearestFree(gx,gy){
+  if(!blocked[gy*GW+gx])return[gx,gy];
+  for(let r=1;r<8;r++)for(let dy=-r;dy<=r;dy++)for(let dx=-r;dx<=r;dx++){
+    const nx=gx+dx,ny=gy+dy;
+    if(nx>=0&&ny>=0&&nx<GW&&ny<GH&&!blocked[ny*GW+nx])return[nx,ny];
+  }
+  return[gx,gy];
+}
+function astar(sx,sy,tx,ty){
+  let[sgx,sgy]=nearestFree(clamp(Math.floor(sx/CELL),0,GW-1),clamp(Math.floor(sy/CELL),0,GH-1));
+  let[tgx,tgy]=nearestFree(clamp(Math.floor(tx/CELL),0,GW-1),clamp(Math.floor(ty/CELL),0,GH-1));
+  const open=[sgy*GW+sgx];
+  const came=new Int32Array(GW*GH).fill(-1);
+  const g=new Float32Array(GW*GH).fill(Infinity);
+  const f=new Float32Array(GW*GH).fill(Infinity);
+  const inOpen=new Uint8Array(GW*GH);
+  g[sgy*GW+sgx]=0; f[sgy*GW+sgx]=0; inOpen[sgy*GW+sgx]=1;
+  const target=tgy*GW+tgx;
+  let iter=0;
+  while(open.length&&iter++<4000){
+    let bi=0;for(let i=1;i<open.length;i++)if(f[open[i]]<f[open[bi]])bi=i;
+    const cur=open.splice(bi,1)[0]; inOpen[cur]=0;
+    if(cur===target)break;
+    const cx=cur%GW,cy=(cur/GW)|0;
+    for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
+      if(!dx&&!dy)continue;
+      const nx=cx+dx,ny=cy+dy;
+      if(nx<0||ny<0||nx>=GW||ny>=GH)continue;
+      const ni=ny*GW+nx;
+      if(blocked[ni])continue;
+      if(dx&&dy&&(blocked[cy*GW+nx]||blocked[ny*GW+cx]))continue; // 코너 끼임 방지
+      const ng=g[cur]+(dx&&dy?1.414:1);
+      if(ng<g[ni]){
+        g[ni]=ng; came[ni]=cur;
+        f[ni]=ng+Math.hypot(tgx-nx,tgy-ny);
+        if(!inOpen[ni]){open.push(ni);inOpen[ni]=1;}
+      }
+    }
+  }
+  if(came[target]<0&&target!==sgy*GW+sgx)return null;
+  const path=[];
+  let cur=target;
+  while(cur>=0){path.push({x:(cur%GW)*CELL+CELL/2,y:((cur/GW)|0)*CELL+CELL/2});cur=came[cur];}
+  path.reverse();
+  // LOS 스무딩
+  for(let i=0;i<path.length-2;){
+    if(hasLOS(path[i].x,path[i].y,path[i+2].x,path[i+2].y))path.splice(i+1,1);
+    else i++;
+  }
+  return path;
+}
+
+/* ---------------- 오디오 (WebAudio 합성) ---------------- */
+let AC=null;
+function audioInit(){if(!AC){AC=new (window.AudioContext||window.webkitAudioContext)();}}
+function noiseBurst(dur,lp,vol,delay=0){
+  if(!AC)return;
+  const t0=AC.currentTime+delay;
+  const len=Math.max(1,(dur*AC.sampleRate)|0);
+  const buf=AC.createBuffer(1,len,AC.sampleRate);
+  const d=buf.getChannelData(0);
+  for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*(1-i/len);
+  const src=AC.createBufferSource();src.buffer=buf;
+  const fl=AC.createBiquadFilter();fl.type="lowpass";fl.frequency.value=lp;
+  const gn=AC.createGain();gn.gain.setValueAtTime(vol,t0);
+  gn.gain.exponentialRampToValueAtTime(0.001,t0+dur);
+  src.connect(fl);fl.connect(gn);gn.connect(AC.destination);
+  src.start(t0);
+}
+function tone(freq,dur,vol,type="sine",delay=0){
+  if(!AC)return;
+  const t0=AC.currentTime+delay;
+  const o=AC.createOscillator();o.type=type;o.frequency.value=freq;
+  const g=AC.createGain();g.gain.setValueAtTime(vol,t0);
+  g.gain.exponentialRampToValueAtTime(0.001,t0+dur);
+  o.connect(g);g.connect(AC.destination);
+  o.start(t0);o.stop(t0+dur);
+}
+const sfx={
+  shot(kind,vol=1){
+    if(kind==="ak"){noiseBurst(0.1,1900,0.5*vol);tone(110,0.07,0.32*vol,"square");}
+    else if(kind==="smg"){noiseBurst(0.07,2200,0.38*vol);tone(140,0.05,0.2*vol,"square");}
+    else if(kind==="awp"){noiseBurst(0.18,900,0.85*vol);tone(60,0.22,0.55*vol,"sine");tone(200,0.1,0.3*vol,"square",0.02);}
+    else if(kind==="pistol"){noiseBurst(0.07,2500,0.4*vol);tone(150,0.05,0.22*vol,"square");}
+    else{noiseBurst(0.12,650,0.18*vol);}
+  },
+  hit(){noiseBurst(0.05,900,0.32);},
+  head(){tone(1280,0.1,0.3,"square");tone(1700,0.14,0.18,"sine",0.03);},
+  killConfirm(){
+    // 처치 확인: 낮은 삐 + 틱
+    tone(440,0.05,0.22,"square");
+    tone(660,0.08,0.18,"square",0.05);
+  },
+  dry(){tone(2100,0.03,0.12,"square");},
+  reload(){tone(700,0.04,0.15,"square");tone(900,0.04,0.15,"square",0.18);},
+  roll(){noiseBurst(0.22,520,0.3);},
+  step(vol){noiseBurst(0.035,420,vol);},
+  death(){noiseBurst(0.3,300,0.4);tone(80,0.25,0.3,"sine");}
+};
+
+/* ---------------- 사운드(게임) 시스템 ---------------- */
+const rings=[];   // 시각화
+// 종류별 링 표시 최대 거리 (카메라 기준 px)
+// 발소리: 근거리만 — 추적해야만 들림
+// 총소리: 멀리서도 보임 — 위치 노출의 핵심
+const RING_SHOW_DIST={step:230,reload:320,roll:300,shot:9999,knife:200};
+function emitNoise(x,y,radius,team,kind){
+  const showR=RING_SHOW_DIST[kind]||350;
+  rings.push({x,y,r:10,max:radius,life:0.55,t:0,kind,showR});
+  for(const b of entities){
+    if(!b.alive||!b.isBot||b.team===team)continue;
+    if(dist2(b.x,b.y,x,y)<radius*radius)b.hearNoise(x,y);
+  }
+}
+
+/* ---------------- 이펙트 ---------------- */
+const tracers=[],particles=[],flashes=[],corpses=[],drops=[],feed=[],floatTexts=[];
+const bloodStains=[];  // 교전 위치 정보 — 15초+ 유지
+function addBloodStain(x,y,r,life){
+  if(bloodStains.length>=MAX_BLOOD_STAINS)bloodStains.shift();
+  bloodStains.push({x,y,r,life,maxLife:life});
+}
+let shake=0,hitFlash=0,hitMarker=0;
+// 킬 순간 슬로모션
+let killSlowT=0;          // 남은 시간
+let killFlash=0;          // 처치 플래시 (녹색)
+let timeScale=1;          // 게임 속도 배율
+// 스코프 상태
+let scoped=false;
+// 선택 무기 (타이틀에서 결정)
+let chosenWeapon="ak";
+const MAX_PARTICLES=240, MAX_BLOOD_STAINS=80;
+function addBlood(x,y,n){
+  if(particles.length>MAX_PARTICLES-n)particles.splice(0,n); // 오래된 것 제거
+  for(let i=0;i<n;i++){
+    const a=rand(0,TAU),s=rand(30,150);
+    particles.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,t:0,life:rand(0.25,0.5),c:"#b3202a",sz:rand(1.5,3.5)});
+  }
+}
+function addSpark(x,y){
+  if(particles.length>MAX_PARTICLES-4)return;
+  for(let i=0;i<4;i++){
+    const a=rand(0,TAU),s=rand(60,200);
+    particles.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,t:0,life:0.18,c:"#e8d27a",sz:1.5});
+  }
+}
+function addFeed(text){feed.push({text,t:4});if(feed.length>5)feed.shift();}
+
+/* ---------------- 엔티티 ---------------- */
+const entities=[];
+let nextId=1;
+function makeEntity(team,x,y,isBot,name){
+  const e={
+    id:nextId++,team,x,y,r:CONFIG.player.radius,headR:CONFIG.player.headRadius,
+    angle:team===0?0:Math.PI,hp:CONFIG.player.hp,alive:true,isBot,name,
+    weaponKey:"ak",prevKey:"pistol",
+    ammo:{ak:{mag:CONFIG.weapons.ak.mag,reserve:CONFIG.weapons.ak.reserve},
+          pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}},
+    fireCd:0,recoil:0,reloading:0,fireLockUntil:0,
+    stepAcc:0,swing:0,
+    // 봇 전용
+    aware:false,          // false = 플레이어를 모름 → 기습 보너스 적용됨
+    state:"PATROL",path:null,pathI:0,repath:0,stuck:0,lastX:x,lastY:y,
+    targetId:0,lastSeen:null,reactT:0,burst:0,burstPause:0,stateT:0,
+    strafeDir:1,strafeT:0,sweepBase:0,
+    hearNoise(nx,ny){
+      if(!this.alive)return;
+      if(this.state==="ENGAGE")return;
+      this.state="INVESTIGATE";this.stateT=0;
+      this.path=astar(this.x,this.y,nx,ny);this.pathI=0;this.repath=1.5;
+    }
+  };
+  return e;
+}
+function weaponOf(e){return CONFIG.weapons[e.weaponKey];}
+
+/* ---------------- 시야 ---------------- */
+function canSee(v,t,fov,vd){
+  const d2v=dist2(v.x,v.y,t.x,t.y);
+  const cr=CONFIG.vision.closeR;
+  if(d2v<cr*cr)return hasLOS(v.x,v.y,t.x,t.y);
+  if(d2v>vd*vd)return false;
+  const a=Math.atan2(t.y-v.y,t.x-v.x);
+  if(Math.abs(angDiff(v.angle,a))>fov/2)return false;
+  return hasLOS(v.x,v.y,t.x,t.y);
+}
+function visionPolygon(e){
+  let fov=CONFIG.vision.fov, vd=CONFIG.vision.dist;
+  // AWP 스코프: 훨씬 좁고 멀리 보임
+  if(e===player&&scoped){
+    const awp=CONFIG.weapons.awp;
+    fov=awp.scopeFov; vd=awp.scopeDist;
+  }
+  const {rays}=CONFIG.vision;
+  const pts=[];
+  for(let i=0;i<=rays;i++){
+    const a=e.angle-fov/2+(fov*i)/rays;
+    const d=castRay(e.x,e.y,a,vd);
+    pts.push({x:e.x+Math.cos(a)*d,y:e.y+Math.sin(a)*d});
+  }
+  return pts;
+}
+
+/* ---------------- 전투 (히트스캔) ---------------- */
+function fireHitscan(shooter,wp,ang){
+  const ox=shooter.x+Math.cos(shooter.angle)*shooter.r,
+        oy=shooter.y+Math.sin(shooter.angle)*shooter.r;
+  const dx=Math.cos(ang),dy=Math.sin(ang);
+  const wallT=castRay(ox,oy,ang,wp.range);
+  let best=null;
+  for(const e of entities){
+    if(!e.alive||e===shooter||e.team===shooter.team)continue;
+    const rx=e.x-ox,ry=e.y-oy;
+    const t=rx*dx+ry*dy;
+    if(t<0||t>wallT)continue;
+    const px=ox+dx*t,py=oy+dy*t;
+    const dd=dist(px,py,e.x,e.y);
+    if(dd<e.r&&(!best||t<best.t))best={e,t,dd};
+  }
+  let ex,ey;
+  if(best){
+    ex=ox+dx*best.t;ey=oy+dy*best.t;
+    const head=best.dd<best.e.headR;
+    const dmg=head?wp.dmg*wp.headMult:wp.dmg;
+    // 온라인: 원격 플레이어 피격 → 이벤트 전송
+    if(best.e===remoteEntity&&ws&&ws.readyState===1){
+      ws.send(JSON.stringify({type:'hit',dmg,head}));
+    }else{
+      applyDamage(best.e,dmg,head,shooter);
+    }
+    addBlood(ex,ey,head?12:6);
+    addBloodStain(ex,ey,rand(4,7),15);
+    if(shooter===player){hitMarker=0.12;if(head)sfx.head();else sfx.hit();}
+  }else{
+    ex=ox+dx*wallT;ey=oy+dy*wallT;
+    if(wallT<wp.range)addSpark(ex,ey);
+  }
+  const tLife=rand(0.8,1.0);
+  tracers.push({x1:ox,y1:oy,x2:ex,y2:ey,t:tLife,life:tLife});
+  flashes.push({x:ox,y:oy,ang,t:0.05});
+  // 온라인: 발사 시각 효과 전송 (상대방 화면에서 트레이서/사운드)
+  if(shooter===player&&ws&&ws.readyState===1){
+    ws.send(JSON.stringify({type:'shot',wk:shooter.weaponKey,ox:Math.round(ox),oy:Math.round(oy),ex:Math.round(ex),ey:Math.round(ey)}));
+  }
+}
+function applyDamage(e,dmg,head,shooter){
+  if(!e.alive)return;
+  // 기습 보너스: 미인지 적에게 첫 발 1.5배 피해
+  let finalDmg=dmg;
+  const ambush=e.isBot&&!e.aware&&shooter===player&&(e.state==="PATROL"||e.state==="INVESTIGATE");
+  if(ambush){
+    finalDmg=dmg*1.5;
+    addFeed("기습!");
+  }
+  e.hp-=finalDmg;
+  if(e===player){shake=Math.max(shake,6);hitFlash=0.3;}
+  // 피격당하면 공격자 방향 인지 (봇)
+  if(e.isBot&&shooter){
+    e.aware=true;
+    e.state="ENGAGE";e.targetId=shooter.id;
+    e.lastSeen={x:shooter.x,y:shooter.y};
+    if(e.reactT<=0)e.reactT=rand(0.1,0.25);
+  }
+  if(e.hp<=0)kill(e,head,shooter);
+}
+function kill(e,head,shooter){
+  e.alive=false;e.hp=0;
+  corpses.push({x:e.x,y:e.y,angle:e.angle,team:e.team,weapon:e.weaponKey,age:0});
+  // 무기 + 탄약 드랍
+  const dropWep=e.weaponKey==="knife"?"pistol":e.weaponKey;
+  const dropAm=(e.ammo&&e.ammo[dropWep])||{mag:CONFIG.weapons[dropWep].mag,reserve:0};
+  drops.push({x:e.x+rand(-14,14),y:e.y+rand(-14,14),weaponKey:dropWep,mag:dropAm.mag,reserve:dropAm.reserve});
+  sfx.death();
+  addBlood(e.x,e.y,head?28:18);
+  // 사망 혈흔 — 큰 웅덩이, 20초 유지
+  addBloodStain(e.x,e.y,rand(14,20),20);
+  addBloodStain(e.x+rand(-18,18),e.y+rand(-18,18),rand(6,10),18);
+  addFeed(`${shooter?shooter.name:"?"} ☠ ${e.name}${head?" [헤드샷]":""}`);
+  // 플레이어가 처치했을 때 킬 이펙트
+  if(shooter===player&&e.team===1){
+    killSlowT=CONFIG.killEffect.slowDur;
+    killFlash=0.45;
+    sfx.killConfirm();
+    shake=Math.max(shake,head?4.5:2.5);
+    floatTexts.push({wx:e.x,wy:e.y-16,t:0,life:1.4,vy:-60,text:head?"+300 헤드샷!":"+300",color:head?"#f9d74a":"#4cd47a",size:head?20:18});
+  }
+}
+
+/* ---------------- 발사/장전 공통 ---------------- */
+function tryFire(e,aimAng,focus){
+  const wp=weaponOf(e);
+  if(e.reloading>0||e.fireCd>0)return false;
+  if(performance.now()/1000<e.fireLockUntil)return false;
+  if(wp.melee){
+    e.fireCd=60/wp.rpm; e.swing=0.15;
+    emitNoise(e.x,e.y,wp.noise,e.team,"knife");
+    if(e===player||visibleToCam(e))sfx.shot("knife",volByDist(e));
+    // 근접 판정
+    for(const t of entities){
+      if(!t.alive||t.team===e.team)continue;
+      const d=dist(e.x,e.y,t.x,t.y);
+      if(d<wp.range+t.r&&Math.abs(angDiff(e.angle,Math.atan2(t.y-e.y,t.x-e.x)))<wp.arc/2){
+        applyDamage(t,wp.dmg,false,e);
+        addBlood(t.x,t.y,8);
+        if(e===player){hitMarker=0.12;sfx.hit();}
+      }
+    }
+    return true;
+  }
+  const am=e.ammo[e.weaponKey];
+  if(am.mag<=0){if(e===player)sfx.dry();startReload(e);return false;}
+  am.mag--;
+  e.fireCd=60/wp.rpm;
+  // 탄퍼짐 = 기본 + 이동 + 반동, 집중사격 시 감소
+  const moving=Math.min(1,e.moveMag||0);
+  let spread=wp.spread+moving*wp.moveSpread+e.recoil;
+  if(focus)spread*=CONFIG.focus.spreadMult;
+  e.recoil=Math.min(wp.recoilMax,e.recoil+wp.recoil);
+  const ang=aimAng+rand(-spread,spread);
+  fireHitscan(e,wp,ang);
+  emitNoise(e.x,e.y,wp.noise,e.team,"shot");
+  sfx.shot(e.weaponKey,e===player?1:volByDist(e));
+  if(e===player)shake=Math.max(shake,e.weaponKey==="ak"?2.2:1.5);
+  if(e===player&&e.weaponKey==="awp")scoped=false;
+  return true;
+}
+function startReload(e){
+  const wp=weaponOf(e);
+  if(wp.melee||e.reloading>0)return;
+  const am=e.ammo[e.weaponKey];
+  if(am.mag>=wp.mag||am.reserve<=0)return;
+  e.reloading=wp.reloadTime;
+  emitNoise(e.x,e.y,CONFIG.noise.reload,e.team,"reload");
+  if(e===player)sfx.reload();
+}
+function finishReload(e){
+  const wp=weaponOf(e),am=e.ammo[e.weaponKey];
+  const need=wp.mag-am.mag,take=Math.min(need,am.reserve);
+  am.mag+=take;am.reserve-=take;
+}
+function switchWeapon(e,key){
+  if(e.weaponKey===key)return;
+  e.prevKey=e.weaponKey;e.weaponKey=key;
+  e.reloading=0;e.recoil=0;
+}
+function volByDist(e){return clamp(1-dist(camX(),camY(),e.x,e.y)/900,0,1)*0.8;}
+
+/* ---------------- 입력 ---------------- */
+const keys={},mouse={x:0,y:0,l:false,r:false};
+addEventListener("keydown",ev=>{
+  keys[ev.code]=true;
+  if(ev.code==="Space")ev.preventDefault();
+  if(ev.code==="F1"){ev.preventDefault();CONFIG.debug=!CONFIG.debug;}
+  if(gameState==="menu"||gameState==="title"||gameState==="paused")return;
+  if(ev.code==="Escape"&&gameState==="game"){gameState="paused";scoped=false;return;}
+  if(!player||!player.alive||round.state!=="play")return;
+  if(ev.code==="KeyR")startReload(player);
+  if(ev.code==="Digit1"){if(player.ammo[chosenWeapon])switchWeapon(player,chosenWeapon);}
+  if(ev.code==="Digit2")switchWeapon(player,"pistol");
+  if(ev.code==="Digit3")switchWeapon(player,"knife");
+  if(ev.code==="KeyQ"){if(player.ammo[player.prevKey])switchWeapon(player,player.prevKey);}
+  if(ev.code==="KeyF")doPickup(player);
+  if(ev.code==="KeyG"){
+    const cur=player.weaponKey,cwp=CONFIG.weapons[cur];
+    if(!cwp.melee&&cur!=="pistol"){
+      const am=player.ammo[cur];
+      drops.push({x:player.x+Math.cos(player.angle)*22,y:player.y+Math.sin(player.angle)*22,weaponKey:cur,mag:am.mag,reserve:am.reserve,spawnT:0.8});
+      delete player.ammo[cur];
+      player.weaponKey="pistol";player.prevKey="pistol";
+      player.reloading=0;player.recoil=0;
+      scoped=false;
+      addFeed(`${cwp.name} 버림`);tone(280,0.1,0.2,"sawtooth");
+    }
+  }
+});
+addEventListener("keyup",ev=>keys[ev.code]=false);
+addEventListener("mousemove",ev=>{mouse.x=ev.clientX;mouse.y=ev.clientY;});
+function inBtn(bx,by,bw,bh){return mouse.x>=bx&&mouse.x<=bx+bw&&mouse.y>=by&&mouse.y<=by+bh;}
+addEventListener("mousedown",ev=>{
+  audioInit();
+  if(gameState==="lobby"){
+    // 무기 선택 버튼 (항상 클릭 가능)
+    [{key:"ak"},{key:"smg"},{key:"awp"}].forEach((wc,i)=>{
+      if(inBtn(W/2-150+i*100,H/2-115,90,34))chosenWeapon=wc.key;
+    });
+    if(netState==="lobby"){
+      if(inBtn(W/2-200,H/2-20,185,52)){
+        // 방 만들기
+        if(ws&&ws.readyState===1){ws.send(JSON.stringify({type:'create'}));}
+      }
+      if(inBtn(W/2+15,H/2-20,185,52)){
+        // 방 참가
+        lobbyInputMode=true;lobbyInput="";
+      }
+    }
+    if(netState==="error"&&inBtn(W/2-100,H/2+10,200,44)){
+      connectToServer();
+    }
+    // 뒤로가기
+    if(inBtn(W/2-90,H/2+160,180,40)){
+      if(ws){ws.close();ws=null;}
+      netState="idle";lobbyInputMode=false;gameState="menu";
+    }
+    return;
+  }
+  if(gameState==="menu"){
+    const bw=480,bh=70,bx=W/2-bw/2;
+    gameModes.forEach((m,i)=>{
+      const by=H/2-78+i*84;
+      if(ev.clientX>=bx&&ev.clientX<=bx+bw&&ev.clientY>=by&&ev.clientY<=by+bh){
+        if(menuModeIdx===i&&m.ready){
+          if(m.key==="online"){gameState="lobby";connectToServer();}
+          else gameState="title";
+        }else{menuModeIdx=i;}
+      }
+    });
+    return;
+  }
+  if(gameState==="title"){
+    // 뒤로가기 버튼
+    const bbw=160,bbh=38,bbx=W/2-bbw/2,bby=H/2+214;
+    if(ev.clientX>=bbx&&ev.clientX<=bbx+bbw&&ev.clientY>=bby&&ev.clientY<=bby+bbh){
+      gameState="menu";return;
+    }
+    const bw=420,bx=W/2-bw/2,bh=60;
+    weaponChoices.forEach((wc,i)=>{
+      const by=H/2-60+i*76;
+      if(ev.clientX>=bx&&ev.clientX<=bx+bw&&ev.clientY>=by&&ev.clientY<=by+bh){
+        if(titleWeaponIdx===i){startGame();}
+        else{titleWeaponIdx=i;}
+      }
+    });
+    return;
+  }
+  if(gameState==="paused"){
+    // 계속하기 / 메인메뉴 버튼
+    const bw=280,bx=W/2-bw/2;
+    if(ev.clientX>=bx&&ev.clientX<=bx+bw&&ev.clientY>=H/2-10&&ev.clientY<=H/2+40){gameState="game";}
+    if(ev.clientX>=bx&&ev.clientX<=bx+bw&&ev.clientY>=H/2+54&&ev.clientY<=H/2+104){gameState="menu";scoped=false;}
+    return;
+  }
+  if(ev.button===0)mouse.l=true;
+  if(ev.button===2){
+    // AWP: 우클릭 = 스코프 토글 / 나머지 무기: 집중사격 홀드
+    if(player&&player.alive&&player.weaponKey==="awp") scoped=!scoped;
+    else mouse.r=true;
+  }
+});
+addEventListener("mouseup",ev=>{
+  if(ev.button===0)mouse.l=false;
+  if(ev.button===2)mouse.r=false;
+});
+addEventListener("wheel",ev=>{
+  if(!scoped)return;
+  ev.preventDefault();
+  const step=ev.deltaY<0?0.4:-0.4;
+  scopeZoom=clamp(scopeZoom+step,1.6,7.0);
+},{passive:false});
+addEventListener("contextmenu",ev=>ev.preventDefault());
+
+/* ---------------- 플레이어 ---------------- */
+let player=null;
+let roll={active:false,t:0,dirX:0,dirY:0,cd:0};
+function updatePlayer(dt,now){
+  const p=player;
+  if(!p.alive){scoped=false;return;}
+  const wp=weaponOf(p);
+  // 조준
+  const mwx=mouse.x+camRX-W/2, mwy=mouse.y+camRY-H/2;
+  if(!roll.active)p.angle=Math.atan2(mwy-p.y,mwx-p.x);
+  // 이동
+  let mx=(keys.KeyD?1:0)-(keys.KeyA?1:0);
+  let my=(keys.KeyS?1:0)-(keys.KeyW?1:0);
+  const ml=Math.hypot(mx,my);
+  if(ml>0){mx/=ml;my/=ml;}
+  const walking=keys.ShiftLeft||keys.ShiftRight;
+  roll.cd=Math.max(0,roll.cd-dt);
+  // 구르기 시작
+  if(keys.Space&&!roll.active&&roll.cd<=0){
+    roll.active=true;roll.t=0;roll.cd=CONFIG.roll.cooldown;
+    if(ml>0){roll.dirX=mx;roll.dirY=my;}
+    else{roll.dirX=Math.cos(p.angle);roll.dirY=Math.sin(p.angle);}
+    emitNoise(p.x,p.y,CONFIG.roll.noise,p.team,"roll");
+    sfx.roll();
+  }
+  if(roll.active){
+    roll.t+=dt;
+    const sp=CONFIG.roll.dist*(weaponOf(p).rollMult||1)/CONFIG.roll.time;
+    moveWithCollision(p,roll.dirX*sp,roll.dirY*sp,dt);
+    p.moveMag=1;
+    if(roll.t>=CONFIG.roll.time){
+      roll.active=false;
+      p.fireLockUntil=now+CONFIG.roll.fireLock;
+    }
+  }else{
+    let sp=CONFIG.player.speed*wp.speedMult;
+    if(walking)sp*=CONFIG.player.walkMult;
+    if(scoped)sp*=0.55;                          // 스코프 중 이동 느림
+    else if(mouse.r&&!wp.melee)sp*=CONFIG.focus.speedMult;
+    moveWithCollision(p,mx*sp,my*sp,dt);
+    p.moveMag=ml*(walking?0.45:1);
+    // 발소리
+    if(ml>0){
+      p.stepAcc+=sp*dt;
+      if(p.stepAcc>CONFIG.noise.stepEveryPx){
+        p.stepAcc=0;
+        emitNoise(p.x,p.y,walking?CONFIG.noise.walk:CONFIG.noise.run,p.team,"step");
+        sfx.step(walking?0.04:0.09);
+      }
+    }
+  }
+  // 구르기 시작 또는 무기 교체 시 스코프 해제
+  if(roll.active||wp!==CONFIG.weapons.awp)scoped=false;
+
+  // 사격
+  const wantFire=wp.auto?mouse.l:(mouse.l&&!p.firedHold);
+  if(mouse.l){
+    if(wantFire&&!roll.active)tryFire(p,p.angle,mouse.r);
+    p.firedHold=true;
+  }else p.firedHold=false;
+}
+
+// F키 수동 픽업
+function doPickup(p){
+  let bestI=-1,bestD2=34*34;
+  for(let i=0;i<drops.length;i++){
+    const d=drops[i];
+    if((d.spawnT||0)>0)continue;
+    const d2=dist2(p.x,p.y,d.x,d.y);
+    if(d2<bestD2){bestD2=d2;bestI=i;}
+  }
+  if(bestI<0)return;
+  const d=drops[bestI],wk=d.weaponKey,wp=CONFIG.weapons[wk];
+  if(!wp){drops.splice(bestI,1);return;}
+  if(p.ammo[wk]){
+    p.ammo[wk].reserve=Math.min(p.ammo[wk].reserve+(d.reserve||0),wp.reserve);
+    addFeed(`탄약 보충 (${wp.name})`);
+    drops.splice(bestI,1);
+  }else{
+    if(wp.slot===1){
+      const curKey=Object.keys(p.ammo).find(k=>CONFIG.weapons[k]?.slot===1);
+      if(curKey){
+        const ca=p.ammo[curKey];
+        drops.push({x:p.x+rand(-18,18),y:p.y+rand(-18,18),weaponKey:curKey,mag:ca.mag,reserve:ca.reserve,spawnT:0.6});
+        delete p.ammo[curKey];
+        if(p.weaponKey===curKey||p.prevKey===curKey){p.weaponKey="pistol";p.prevKey="pistol";}
+      }
+    }
+    p.ammo[wk]={mag:d.mag,reserve:d.reserve};
+    drops.splice(bestI,1);
+    switchWeapon(p,wk);
+    addFeed(`${wp.name} 획득!`);
+  }
+  tone(880,0.06,0.15,"sine");tone(1100,0.06,0.15,"sine",0.06);
+}
+
+/* ---------------- 봇 AI (FSM) ---------------- */
+function botPathTo(b,x,y){b.path=astar(b.x,b.y,x,y);b.pathI=0;}
+function followPath(b,speed,dt){
+  if(!b.path||b.pathI>=b.path.length)return false;
+  const n=b.path[b.pathI];
+  if(dist2(b.x,b.y,n.x,n.y)<196){b.pathI++;return followPath(b,speed,dt);} // 14²=196
+  const a=Math.atan2(n.y-b.y,n.x-b.x);
+  moveWithCollision(b,Math.cos(a)*speed,Math.sin(a)*speed,dt);
+  b.angle=turnToward(b.angle,a,CONFIG.bot.turnSpeed*dt);
+  b.moveMag=1;
+  return true;
+}
+function botStep(b,speedPxMoved,dt){
+  b.stepAcc+=speedPxMoved*dt;
+  if(b.stepAcc>CONFIG.noise.stepEveryPx){
+    b.stepAcc=0;
+    emitNoise(b.x,b.y,CONFIG.noise.run,b.team,"step");
+    const v=volByDist(b);
+    if(v>0.05)sfx.step(v*0.1);
+  }
+}
+function updateBot(b,dt){
+  if(!b.alive)return;
+  const C=CONFIG.bot;
+  b.stateT+=dt;
+  b.repath-=dt;
+  const px=b.x,py=b.y;
+  // 적 탐지
+  let seen=null,seenD=Infinity;
+  for(const t of entities){
+    if(!t.alive||t.team===b.team)continue;
+    if(canSee(b,t,C.fov,C.dist)){
+      const d=dist2(b.x,b.y,t.x,t.y);
+      if(d<seenD){seen=t;seenD=d;}
+    }
+  }
+  if(seen){
+    if(b.state!=="ENGAGE"){b.state="ENGAGE";b.aware=true;b.reactT=rand(C.reactMin,C.reactMax);b.burst=0;b.burstPause=0;}
+    b.targetId=seen.id;
+    b.lastSeen={x:seen.x,y:seen.y};
+  }else if(b.state==="ENGAGE"){
+    b.state="SEARCH";b.stateT=0;
+    if(b.lastSeen)botPathTo(b,b.lastSeen.x,b.lastSeen.y);
+  }
+  // 장전 처리
+  if(b.reloading>0){
+    b.reloading-=dt;
+    if(b.reloading<=0)finishReload(b);
+  }else{
+    const bam=b.ammo[b.weaponKey];
+    if(bam&&bam.mag<=0){
+      if(bam.reserve>0)startReload(b);
+      else switchWeapon(b,"pistol");
+    }
+  }
+  b.recoil=Math.max(0,b.recoil-(weaponOf(b).recoilDecay||0)*dt);
+  b.moveMag=0;
+
+  switch(b.state){
+    case "PATROL":{
+      if(!b.path||b.pathI>=b.path.length){
+        const wpt=waypoints[randi(0,waypoints.length-1)];
+        botPathTo(b,wpt.x,wpt.y);
+      }
+      followPath(b,C.speed*0.85,dt);
+      break;
+    }
+    case "INVESTIGATE":{
+      const moving=followPath(b,C.speed,dt);
+      if(!moving){
+        // 도착: 둘러보기
+        b.angle+=Math.sin(b.stateT*3)*2.2*dt;
+        if(b.stateT>C.investigateLook+1.2){b.state="PATROL";b.path=null;b.stateT=0;}
+      }
+      break;
+    }
+    case "ENGAGE":{
+      const t=entities.find(e=>e.id===b.targetId);
+      if(!t||!t.alive){b.state="PATROL";b.path=null;break;}
+      const ta=Math.atan2(t.y-b.y,t.x-b.x);
+      b.angle=turnToward(b.angle,ta,C.turnSpeed*dt);
+      b.reactT-=dt;
+      // 거리 유지 + 스트레이프
+      const d=dist(b.x,b.y,t.x,t.y);
+      b.strafeT-=dt;
+      if(b.strafeT<=0){b.strafeDir*=-1;b.strafeT=rand(0.7,1.3);}
+      let vx=0,vy=0;
+      const fx=Math.cos(ta),fy=Math.sin(ta);
+      if(d>430){vx+=fx;vy+=fy;}
+      else if(d<170){vx-=fx;vy-=fy;}
+      vx+=-fy*b.strafeDir*0.8;vy+=fx*b.strafeDir*0.8;
+      const vl=Math.hypot(vx,vy);
+      if(vl>0){vx/=vl;vy/=vl;moveWithCollision(b,vx*C.speed*0.7,vy*C.speed*0.7,dt);b.moveMag=0.7;}
+      // 사격 (반응시간 경과 + 조준 정렬 + 버스트)
+      if(b.reactT<=0&&Math.abs(angDiff(b.angle,ta))<0.16&&b.reloading<=0){
+        if(b.burstPause>0)b.burstPause-=dt;
+        else{
+          if(b.burst<=0)b.burst=randi(C.burstMin,C.burstMax);
+          const err=rand(-C.aimErr,C.aimErr)*clamp(d/450,0.35,1);
+          if(tryFire(b,ta+err,false)){
+            b.burst--;
+            if(b.burst<=0)b.burstPause=rand(C.burstPauseMin,C.burstPauseMax);
+          }
+        }
+      }
+      break;
+    }
+    case "SEARCH":{
+      const moving=followPath(b,C.speed,dt);
+      if(!moving){
+        b.angle+=Math.sin(b.stateT*2.5)*2.5*dt;
+        if(b.stateT>C.searchTime){b.state="PATROL";b.path=null;b.stateT=0;}
+      }
+      break;
+    }
+  }
+  // 이동 소음 + 끼임 감지
+  const moved=dist(px,py,b.x,b.y);
+  if(moved>0.5)botStep(b,moved/dt,dt);
+  if(b.path&&b.pathI<b.path.length){
+    if(moved<C.speed*dt*0.15)b.stuck+=dt;else b.stuck=0;
+    if(b.stuck>0.8){b.stuck=0;const end=b.path[b.path.length-1];botPathTo(b,end.x,end.y);}
+  }
+}
+
+/* ---------------- 라운드 ---------------- */
+const round={n:0,state:"pre",t:0,scores:[0,0],msg:""};
+let gameState="menu";
+const weaponChoices=[
+  {key:"awp", label:"AWP", desc:"원샷 처치  |  느린 이동  |  좁은 시야"},
+  {key:"ak",  label:"AK-47",desc:"균형형      |  연사 가능  |  중간 이동"},
+  {key:"smg", label:"SMG",  desc:"빠른 연사   |  빠른 이동  |  단거리 최강"},
+];
+let titleWeaponIdx=0;
+const gameModes=[
+  {key:"online",  label:"온라인 1 vs 1", desc:"방 코드 공유  |  인터넷 실시간  |  1순위",        ready:true},
+  {key:"versus",  label:"AI 대전",        desc:"3 vs 3 봇 전투  |  라운드제  |  혼자 플레이", ready:true},
+  {key:"coop",    label:"협동 모드",      desc:"2인 + AI 4마리  |  친구 1명  |  개발 예정",     ready:false},
+  {key:"story",   label:"스토리 모드",    desc:"싱글 캠페인  |  미션 기반  |  보류",             ready:false},
+];
+let menuModeIdx=0;
+
+addEventListener("keydown",ev=>{
+  if(ev.code==="Space")ev.preventDefault();
+  if(gameState==="lobby"){
+    if(lobbyInputMode){
+      if(ev.code==="Backspace"){lobbyInput=lobbyInput.slice(0,-1);}
+      else if(ev.code==="Escape"){lobbyInputMode=false;lobbyInput="";}
+      else if((ev.code==="Enter"||ev.code==="NumpadEnter")&&lobbyInput.length>=4){
+        if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'join',code:lobbyInput}));
+        lobbyInputMode=false;
+      }else if(lobbyInput.length<6&&ev.key&&ev.key.length===1&&/[A-Za-z0-9]/.test(ev.key)){
+        lobbyInput+=ev.key.toUpperCase();
+      }
+    }else if(ev.code==="Escape"){
+      if(ws){ws.close();ws=null;}
+      netState="idle";gameState="menu";
+    }
+    return;
+  }
+  if(gameState==="menu"){
+    if(ev.code==="ArrowUp"){menuModeIdx=(menuModeIdx+gameModes.length-1)%gameModes.length;}
+    if(ev.code==="ArrowDown"){menuModeIdx=(menuModeIdx+1)%gameModes.length;}
+    if(ev.code==="Enter"||ev.code==="Space"){
+      ev.preventDefault();audioInit();
+      const m=gameModes[menuModeIdx];
+      if(m.ready){
+        if(m.key==="online"){gameState="lobby";connectToServer();}
+        else gameState="title";
+      }
+    }
+    if(ev.code==="Escape"){}
+    return;
+  }
+  if(gameState==="title"){
+    if(ev.code==="ArrowUp"){titleWeaponIdx=(titleWeaponIdx+weaponChoices.length-1)%weaponChoices.length;}
+    if(ev.code==="ArrowDown"){titleWeaponIdx=(titleWeaponIdx+1)%weaponChoices.length;}
+    if(ev.code==="Enter"||ev.code==="Space"){ev.preventDefault();audioInit();startGame();}
+    if(ev.code==="Escape"){gameState="menu";}
+    return;
+  }
+  if(gameState==="paused"){
+    if(ev.code==="Escape"){gameState="game";}
+    return;
+  }
+},{capture:true});
+
+function startGame(){
+  chosenWeapon=weaponChoices[titleWeaponIdx].key;
+  round.n=0;round.scores=[0,0];gameState="game";newRound();
+}
+function newRound(){
+  if(netState==="playing"){startOnlineGame();return;}
+  round.n++;round.state="pre";round.t=CONFIG.round.preTime;
+  entities.length=0;corpses.length=0;drops.length=0;rings.length=0;floatTexts.length=0;
+  tracers.length=0;particles.length=0;flashes.length=0;bloodStains.length=0;
+  scoped=false;scopeZoom=3.2;killSlowT=0;killFlash=0;timeScale=1;
+  roll={active:false,t:0,dirX:0,dirY:0,cd:0};
+  player=makeEntity(0,spawns[0][1].x,spawns[0][1].y,false,"YOU");
+  // 선택 무기 장착
+  player.weaponKey=chosenWeapon;
+  if(chosenWeapon==="awp"){
+    player.ammo={awp:{mag:CONFIG.weapons.awp.mag,reserve:CONFIG.weapons.awp.reserve},
+                 pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}};
+    player.prevKey="pistol";
+  }else if(chosenWeapon==="smg"){
+    player.ammo={smg:{mag:CONFIG.weapons.smg.mag,reserve:CONFIG.weapons.smg.reserve},
+                 pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}};
+    player.prevKey="pistol";
+  }else{
+    player.ammo={ak:{mag:CONFIG.weapons.ak.mag,reserve:CONFIG.weapons.ak.reserve},
+                 pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}};
+    player.prevKey="pistol";
+  }
+  entities.push(player);
+  entities.push(makeEntity(0,spawns[0][0].x,spawns[0][0].y,true,"아군1"));
+  entities.push(makeEntity(0,spawns[0][2].x,spawns[0][2].y,true,"아군2"));
+  for(let i=0;i<3;i++)entities.push(makeEntity(1,spawns[1][i].x,spawns[1][i].y,true,"적"+(i+1)));
+}
+function checkWin(){
+  const a=entities.filter(e=>e.team===0&&e.alive).length;
+  const b=entities.filter(e=>e.team===1&&e.alive).length;
+  if(a===0||b===0){
+    round.state="end";round.t=CONFIG.round.endTime;
+    const team0wins=b===0;
+    if(team0wins)round.scores[0]++;else round.scores[1]++;
+    const myTeam=player?player.team:0;
+    round.msg=(team0wins===(myTeam===0))?"라운드 승리!":"라운드 패배...";
+  }
+}
+
+/* ---------------- 카메라 ---------------- */
+let camRX=0,camRY=0;
+function camEnt(){
+  if(player&&player.alive)return player;
+  if(netState==="playing")return player;
+  return entities.find(e=>e.team===0&&e.alive)||player;
+}
+function camX(){const c=camEnt();return c?c.x:WORLD.w/2;}
+function camY(){const c=camEnt();return c?c.y:WORLD.h/2;}
+function visibleToCam(e){
+  const c=camEnt();
+  if(!c)return false;
+  if(e.team===0)return true;
+  // 스코프 중이면 좁은 FOV + 긴 사거리로 판정
+  if(scoped&&c===player){
+    const awp=CONFIG.weapons.awp;
+    return canSee(c,e,awp.scopeFov,awp.scopeDist);
+  }
+  return canSee(c,e,CONFIG.vision.fov,CONFIG.vision.dist);
+}
+
+/* ---------------- 메인 루프 ---------------- */
+let lastT=performance.now();
+function loop(){
+  requestAnimationFrame(loop);
+  const nowMs=performance.now();
+  let rawDt=Math.min(0.033,(nowMs-lastT)/1000);
+  lastT=nowMs;
+  // 킬 슬로모션
+  if(killSlowT>0){
+    killSlowT-=rawDt;
+    timeScale=CONFIG.killEffect.slowScale;
+    if(killSlowT<=0){timeScale=1;killSlowT=0;}
+  }else{timeScale=1;}
+  let dt=rawDt*timeScale;
+  const now=nowMs/1000;
+
+  // 온라인: 20Hz 상태 전송
+  if(netState==="playing"&&gameState==="game"){
+    netSendTimer-=rawDt;
+    if(netSendTimer<=0){netSendTimer=1/20;sendPlayerState();}
+  }
+
+  if(gameState==="game"){
+    if(round.state==="pre"){
+      round.t-=dt;
+      if(round.t<=0)round.state="play";
+    }else if(round.state==="play"){
+      updatePlayer(dt,now);
+      for(const e of entities)if(e.isBot&&e!==remoteEntity)updateBot(e,dt);
+      // 공통 타이머
+      for(const e of entities){
+        if(!e.alive)continue;
+        e.fireCd=Math.max(0,e.fireCd-dt);
+        if(!e.isBot){
+          e.recoil=Math.max(0,e.recoil-(weaponOf(e).recoilDecay||0)*dt);
+          if(e.reloading>0){e.reloading-=dt;if(e.reloading<=0)finishReload(e);}
+        }
+        if(e.swing>0)e.swing-=dt;
+      }
+      checkWin();
+    }else if(round.state==="end"){
+      round.t-=dt;
+      if(round.t<=0)newRound();
+    }
+  }
+
+  // 이펙트 업데이트 (rawDt: 슬로모션 중에도 이펙트는 빠르게 사라지지 않음)
+  for(let i=tracers.length-1;i>=0;i--){tracers[i].t-=rawDt;if(tracers[i].t<=0)tracers.splice(i,1);}
+  for(let i=flashes.length-1;i>=0;i--){flashes[i].t-=rawDt;if(flashes[i].t<=0)flashes.splice(i,1);}
+  for(let i=particles.length-1;i>=0;i--){
+    const p=particles[i];p.t+=dt;p.x+=p.vx*dt;p.y+=p.vy*dt;p.vx*=0.9;p.vy*=0.9;
+    if(p.t>=p.life)particles.splice(i,1);
+  }
+  for(let i=rings.length-1;i>=0;i--){
+    const r=rings[i];r.t+=rawDt;r.r=lerp(10,r.max,Math.min(1,r.t/0.45));
+    if(r.t>r.life)rings.splice(i,1);
+  }
+  for(let i=feed.length-1;i>=0;i--){feed[i].t-=rawDt;if(feed[i].t<=0)feed.splice(i,1);}
+  for(let i=bloodStains.length-1;i>=0;i--){bloodStains[i].life-=rawDt;if(bloodStains[i].life<=0)bloodStains.splice(i,1);}
+  for(const cp of corpses)cp.age=(cp.age||0)+rawDt;
+  for(let i=floatTexts.length-1;i>=0;i--){floatTexts[i].t+=rawDt;if(floatTexts[i].t>=floatTexts[i].life)floatTexts.splice(i,1);}
+  for(const d of drops)if(d.spawnT>0)d.spawnT-=rawDt;
+  shake=Math.max(0,shake-rawDt*22);
+  hitFlash=Math.max(0,hitFlash-rawDt*1.4);
+  killFlash=Math.max(0,killFlash-rawDt*2.8);
+  hitMarker=Math.max(0,hitMarker-rawDt);
+
+  render();
+}
+
+/* ---------------- 렌더 ---------------- */
+function render(){
+  ctx.fillStyle="#0b0d10";ctx.fillRect(0,0,W,H);
+  if(gameState==="menu"){renderMenu();return;}
+  if(gameState==="lobby"){renderLobby();return;}
+  if(gameState==="title"){renderTitle();return;}
+  const c=camEnt();
+  const sx=shake>0?rand(-shake,shake):0, sy=shake>0?rand(-shake,shake):0;
+  camRX=clamp(c.x,W/2-200,WORLD.w-W/2+200)+sx;
+  camRY=clamp(c.y,H/2-200,WORLD.h-H/2+200)+sy;
+  // 화면이 월드보다 크면 중앙
+  if(W>=WORLD.w)camRX=WORLD.w/2+sx;
+  if(H>=WORLD.h)camRY=WORLD.h/2+sy;
+
+  ctx.save();
+  ctx.translate(W/2-camRX,H/2-camRY);
+
+  // 바닥
+  ctx.fillStyle="#1a1e24";
+  ctx.fillRect(0,0,WORLD.w,WORLD.h);
+  ctx.strokeStyle="rgba(255,255,255,0.035)";ctx.lineWidth=1;
+  for(let x=0;x<=WORLD.w;x+=90){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,WORLD.h);ctx.stroke();}
+  for(let y=0;y<=WORLD.h;y+=90){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(WORLD.w,y);ctx.stroke();}
+
+  // 피 흔적 (바닥 위, 안개에 가려짐 — 직접 접근해야 보임)
+  for(const s of bloodStains){
+    const lifeRatio=s.life/s.maxLife;
+    ctx.fillStyle=`rgba(100,10,15,${lifeRatio*0.78})`;
+    ctx.beginPath();ctx.arc(s.x,s.y,s.r,0,TAU);ctx.fill();
+  }
+
+  // 드랍 무기
+  for(const d of drops){
+    const dwp=CONFIG.weapons[d.weaponKey];
+    if(!dwp)continue;
+    const isAwp=d.weaponKey==="awp",isSmg=d.weaponKey==="smg",isAk=d.weaponKey==="ak",isPistol=d.weaponKey==="pistol",isKnife=d.weaponKey==="knife";
+    // 외부 글로우
+    ctx.strokeStyle=isAwp?"rgba(100,170,255,0.35)":"rgba(220,190,60,0.3)";
+    ctx.lineWidth=10;
+    ctx.beginPath();ctx.arc(d.x,d.y,15,0,TAU);ctx.stroke();
+    // 배경 원
+    ctx.fillStyle="rgba(20,28,18,0.92)";
+    ctx.strokeStyle=isAwp?"#5599cc":isKnife?"#8899aa":"#c8a030";
+    ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.arc(d.x,d.y,13,0,TAU);ctx.fill();ctx.stroke();
+    // 무기 실루엣
+    ctx.save();ctx.translate(d.x,d.y);
+    if(isAwp){
+      ctx.strokeStyle="#88bbee";ctx.lineWidth=2;
+      ctx.beginPath();ctx.moveTo(-11,0);ctx.lineTo(11,0);ctx.stroke();
+      ctx.strokeStyle="rgba(80,140,200,0.9)";ctx.lineWidth=5;
+      ctx.beginPath();ctx.moveTo(-3,0);ctx.lineTo(5,0);ctx.stroke();
+    }else if(isAk||isSmg){
+      ctx.strokeStyle="#ccdde8";ctx.lineWidth=2.5;
+      ctx.beginPath();ctx.moveTo(-10,0);ctx.lineTo(9,0);ctx.stroke();
+      ctx.fillStyle="#7a8fa0";ctx.fillRect(-4,1,6,6);
+    }else if(isPistol){
+      ctx.strokeStyle="#ccdde8";ctx.lineWidth=2.5;
+      ctx.beginPath();ctx.moveTo(-7,0);ctx.lineTo(7,0);ctx.stroke();
+      ctx.fillStyle="#7a8fa0";ctx.fillRect(-3,1,4,5);
+    }else if(isKnife){
+      ctx.strokeStyle="#c8d4dc";ctx.lineWidth=1.5;
+      ctx.beginPath();ctx.moveTo(-8,-2.5);ctx.lineTo(8,0);ctx.lineTo(-8,2.5);ctx.closePath();ctx.stroke();
+      ctx.fillStyle="rgba(180,200,215,0.35)";ctx.fill();
+    }
+    ctx.restore();
+    // 무기 이름 레이블
+    ctx.font="bold 9px monospace";ctx.textAlign="center";
+    ctx.fillStyle=isAwp?"#88ccff":"#f0d060";
+    ctx.fillText(dwp.name,d.x,d.y+26);
+    // 탄약 표시
+    if(!dwp.melee){
+      ctx.font="8px monospace";
+      ctx.fillStyle="rgba(180,200,180,0.8)";
+      ctx.fillText(`${d.mag||0}/${d.reserve||0}`,d.x,d.y+35);
+    }
+    // 가까우면 F 줍기 힌트
+    if(player&&player.alive&&(d.spawnT||0)<=0&&dist2(player.x,player.y,d.x,d.y)<34*34){
+      ctx.font="bold 11px monospace";ctx.fillStyle="#f0e070";
+      ctx.fillText("F — 줍기",d.x,d.y-20);
+    }
+  }
+  for(const cp of corpses){
+    const age=cp.age||0;
+    // 신선한 시체(0~8초): 맥박 링 — "최근 교전, 위험"
+    if(age<8){
+      const pulse=Math.sin(age*6)*0.5+0.5;   // 빠른 맥박
+      const freshA=(1-age/8)*0.6*pulse;
+      ctx.strokeStyle=cp.team===1?`rgba(255,80,80,${freshA})`:`rgba(80,160,255,${freshA})`;
+      ctx.lineWidth=2;
+      ctx.beginPath();ctx.arc(cp.x,cp.y,18+pulse*6,0,TAU);ctx.stroke();
+    }
+    ctx.save();ctx.translate(cp.x,cp.y);ctx.rotate(cp.angle);
+    // 시체 몸통 — 엎드린 캡슐 형태
+    const bodyAlpha=Math.max(0.25, 1-age/60);  // 1분에 걸쳐 서서히 흐려짐
+    ctx.globalAlpha=bodyAlpha;
+    ctx.fillStyle=cp.team===0?"#223344":"#441818";
+    ctx.beginPath();ctx.ellipse(0,0,14,9,0,0,TAU);ctx.fill();
+    // X 마커
+    ctx.strokeStyle="rgba(0,0,0,0.55)";ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(-5,-5);ctx.lineTo(5,5);ctx.moveTo(5,-5);ctx.lineTo(-5,5);ctx.stroke();
+    ctx.globalAlpha=1;
+    ctx.restore();
+    // 신선도 텍스트 (5초 이내)
+    if(age<5){
+      const textA=(1-age/5)*0.85;
+      ctx.fillStyle=`rgba(255,200,100,${textA})`;
+      ctx.font="bold 10px monospace";ctx.textAlign="center";
+      ctx.fillText("!",cp.x,cp.y-22);
+    }
+  }
+
+  // 벽
+  for(const w of walls){
+    ctx.fillStyle="#3a4150";
+    ctx.fillRect(w.x,w.y,w.w,w.h);
+    ctx.fillStyle="#4a5365";
+    ctx.fillRect(w.x,w.y,w.w,4);
+  }
+
+  // 엔티티
+  for(const e of entities){
+    if(!e.alive)continue;
+    if(e.team!==0&&!visibleToCam(e))continue;
+    drawEntity(e);
+  }
+
+  // 트레이서/플래시/파티클
+  for(const t of tracers){
+    // 대부분의 시간 선명하게 유지, 마지막 0.2초에 fade
+    const fade=Math.min(1,t.t/0.2);
+    ctx.strokeStyle=`rgba(255,235,160,${fade*0.82})`;
+    ctx.lineWidth=1.8;
+    ctx.beginPath();ctx.moveTo(t.x1,t.y1);ctx.lineTo(t.x2,t.y2);ctx.stroke();
+  }
+  for(const f of flashes){
+    ctx.fillStyle=`rgba(255,220,120,${f.t/0.05})`;
+    ctx.save();ctx.translate(f.x,f.y);ctx.rotate(f.ang);
+    ctx.beginPath();ctx.moveTo(0,-4);ctx.lineTo(16,0);ctx.lineTo(0,4);ctx.fill();
+    ctx.restore();
+  }
+  for(const p of particles){
+    ctx.fillStyle=p.c;
+    ctx.globalAlpha=1-p.t/p.life;
+    ctx.fillRect(p.x-p.sz/2,p.y-p.sz/2,p.sz,p.sz);
+    ctx.globalAlpha=1;
+  }
+
+  // 디버그: 봇 시야
+  if(CONFIG.debug){
+    for(const b of entities){
+      if(!b.isBot||!b.alive)continue;
+      ctx.strokeStyle=b.team===0?"rgba(90,160,255,0.25)":"rgba(255,90,90,0.25)";
+      ctx.beginPath();
+      ctx.moveTo(b.x,b.y);
+      ctx.arc(b.x,b.y,CONFIG.bot.dist,b.angle-CONFIG.bot.fov/2,b.angle+CONFIG.bot.fov/2);
+      ctx.closePath();ctx.stroke();
+    }
+  }
+  ctx.restore();
+
+  // ---- 전장의 안개 ----
+  const ce=camEnt();
+  if(ce&&ce.alive){
+    fctx.clearRect(0,0,W,H);
+    fctx.fillStyle=`rgba(6,8,12,${CONFIG.vision.fogAlpha})`;
+    fctx.fillRect(0,0,W,H);
+    fctx.globalCompositeOperation="destination-out";
+    const cx=ce.x-camRX+W/2, cy=ce.y-camRY+H/2;
+    // 시야 콘 (스코프 중이면 시야거리 1600px 사용)
+    const pts=visionPolygon(ce);
+    const curVd=(scoped&&ce===player)?CONFIG.weapons.awp.scopeDist:CONFIG.vision.dist;
+    const g=fctx.createRadialGradient(cx,cy,0,cx,cy,curVd);
+    g.addColorStop(0,"rgba(0,0,0,1)");
+    g.addColorStop(0.88,"rgba(0,0,0,1)");
+    g.addColorStop(1,"rgba(0,0,0,0)");
+    fctx.fillStyle=g;
+    fctx.beginPath();
+    fctx.moveTo(cx,cy);
+    for(const p of pts)fctx.lineTo(p.x-camRX+W/2,p.y-camRY+H/2);
+    fctx.closePath();fctx.fill();
+    // 근접 원형 시야
+    const g2=fctx.createRadialGradient(cx,cy,0,cx,cy,CONFIG.vision.closeR*1.35);
+    g2.addColorStop(0,"rgba(0,0,0,0.95)");
+    g2.addColorStop(1,"rgba(0,0,0,0)");
+    fctx.fillStyle=g2;
+    fctx.beginPath();fctx.arc(cx,cy,CONFIG.vision.closeR*1.35,0,TAU);fctx.fill();
+    fctx.globalCompositeOperation="source-over";
+    ctx.drawImage(fog,0,0);
+  }
+
+  // 사운드 링 (안개 위에 — 사운드 플레이의 핵심)
+  // 발소리: 카메라 230px 이내만 표시 / 총소리: 항상 표시
+  for(const r of rings){
+    const d2cam=dist2(r.x,r.y,camRX,camRY);
+    if(d2cam>r.showR*r.showR)continue;
+    // 근거리 링은 카메라에 가까울수록 더 선명하게 (step만 거리 페이드)
+    const dToCam=r.kind==="step"?Math.sqrt(d2cam):0;
+    const proxAlpha=r.kind==="step"?clamp(1-dToCam/r.showR,0.15,1):1;
+    const a=(1-r.t/r.life)*(r.kind==="shot"?0.62:0.38)*proxAlpha;
+    ctx.strokeStyle=r.kind==="shot"?`rgba(255,200,100,${a})`:`rgba(200,220,255,${a})`;
+    ctx.lineWidth=r.kind==="shot"?2.2:1.2;
+    ctx.beginPath();
+    ctx.arc(r.x-camRX+W/2,r.y-camRY+H/2,r.r,0,TAU);
+    ctx.stroke();
+  }
+
+  // 디버그: 봇 상태 라벨
+  if(CONFIG.debug){
+    ctx.font="11px monospace";ctx.textAlign="center";
+    for(const b of entities){
+      if(!b.isBot||!b.alive)continue;
+      ctx.fillStyle="#fff";
+      ctx.fillText(b.state,b.x-camRX+W/2,b.y-camRY+H/2-22);
+    }
+  }
+
+  // ---- AWP 스코프: 마우스 포인트 중심 3× 확대 ----
+  if(scoped){
+    const mx=mouse.x, my=mouse.y;
+    const srcW=SCOPE_R*2/scopeZoom, srcH=SCOPE_R*2/scopeZoom;
+    const srcX=mx-srcW/2, srcY=my-srcH/2;
+    // 1) 현재 게임 화면(월드+안개) 해당 영역 캡처 → scopeBuf에 확대 저장
+    sbctx.clearRect(0,0,SCOPE_R*2,SCOPE_R*2);
+    sbctx.drawImage(cv, srcX, srcY, srcW, srcH, 0, 0, SCOPE_R*2, SCOPE_R*2);
+    // 2) 전체 어두운 오버레이 (스코프 원 구멍은 evenodd)
+    ctx.fillStyle="rgba(0,0,0,0.93)";
+    ctx.beginPath();
+    ctx.rect(0,0,W,H);
+    ctx.arc(mx,my,SCOPE_R,0,TAU,false);
+    ctx.fill("evenodd");
+    // 3) 스코프 원 안에 확대 화면
+    ctx.save();
+    ctx.beginPath(); ctx.arc(mx,my,SCOPE_R,0,TAU); ctx.clip();
+    ctx.drawImage(scopeBuf, mx-SCOPE_R, my-SCOPE_R);
+    ctx.restore();
+    // 4) 스코프 링
+    ctx.strokeStyle="rgba(120,170,220,0.7)"; ctx.lineWidth=2.5;
+    ctx.beginPath(); ctx.arc(mx,my,SCOPE_R,0,TAU); ctx.stroke();
+    // 5) 십자선 (길게)
+    ctx.strokeStyle="rgba(255,70,70,0.85)"; ctx.lineWidth=1.5;
+    const g=16;
+    ctx.beginPath();
+    ctx.moveTo(mx-SCOPE_R,my); ctx.lineTo(mx-g,my);
+    ctx.moveTo(mx+g,my);       ctx.lineTo(mx+SCOPE_R,my);
+    ctx.moveTo(mx,my-SCOPE_R); ctx.lineTo(mx,my-g);
+    ctx.moveTo(mx,my+g);       ctx.lineTo(mx,my+SCOPE_R);
+    ctx.stroke();
+    // 6) 중앙 점
+    ctx.fillStyle="rgba(255,70,70,0.9)";
+    ctx.beginPath(); ctx.arc(mx,my,2.5,0,TAU); ctx.fill();
+  }
+
+  // 킬 보상 팝업 (화면 좌표 변환 후 렌더)
+  for(const f of floatTexts){
+    const sx=f.wx-camRX+W/2;
+    const sy=f.wy+f.vy*f.t-camRY+H/2;
+    const progress=f.t/f.life;
+    const alpha=progress<0.55?1:(1-(progress-0.55)/0.45);
+    ctx.save();
+    ctx.globalAlpha=Math.max(0,alpha);
+    ctx.font=`bold ${f.size||18}px monospace`;
+    ctx.textAlign="center";
+    ctx.shadowColor="rgba(0,0,0,0.9)";ctx.shadowBlur=6;
+    ctx.fillStyle=f.color||"#4cd47a";
+    ctx.fillText(f.text||"+300",sx,sy);
+    ctx.shadowBlur=0;ctx.globalAlpha=1;
+    ctx.restore();
+  }
+
+  renderHUD();
+  if(gameState==="paused")renderPause();
+}
+
+function drawEntity(e){
+  ctx.save();
+  ctx.translate(e.x,e.y);
+  ctx.rotate(e.angle);
+  // 칼 휘두름
+  if(e.swing>0){
+    ctx.fillStyle="rgba(255,255,255,0.25)";
+    ctx.beginPath();ctx.moveTo(0,0);
+    ctx.arc(0,0,CONFIG.weapons.knife.range,-CONFIG.weapons.knife.arc/2,CONFIG.weapons.knife.arc/2);
+    ctx.closePath();ctx.fill();
+  }
+  // 몸통
+  ctx.fillStyle=e===player?"#5ba0ff":(e.team===0?"#3f7fd6":"#e05252");
+  ctx.beginPath();ctx.arc(0,0,e.r,0,TAU);ctx.fill();
+  // 무기 시각화 (무기별 고유 형태)
+  const wkey=e.weaponKey;
+  const br=e.r*0.4;
+  if(wkey==="awp"){
+    // 긴 저격총 총신 + 스코프 강조
+    ctx.strokeStyle="#b0c8e0";ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(br,0);ctx.lineTo(e.r+26,0);ctx.stroke();
+    ctx.strokeStyle="rgba(80,150,210,0.9)";ctx.lineWidth=6;
+    ctx.beginPath();ctx.moveTo(e.r+2,0);ctx.lineTo(e.r+14,0);ctx.stroke();
+    ctx.fillStyle="rgba(100,160,220,0.8)";
+    ctx.beginPath();ctx.arc(e.r+15,0,2.5,0,TAU);ctx.fill();
+  }else if(wkey==="ak"){
+    // AK: 총신 + 탄창
+    ctx.strokeStyle="#d8e0e8";ctx.lineWidth=4;
+    ctx.beginPath();ctx.moveTo(br,0);ctx.lineTo(e.r+15,0);ctx.stroke();
+    ctx.fillStyle="#8090a0";
+    ctx.fillRect(br,2,7,7);
+  }else if(wkey==="smg"){
+    // SMG: 짧고 두꺼운 총신
+    ctx.strokeStyle="#d8e0e8";ctx.lineWidth=5;
+    ctx.beginPath();ctx.moveTo(br,0);ctx.lineTo(e.r+10,0);ctx.stroke();
+    ctx.fillStyle="#7888a0";
+    ctx.fillRect(br-2,2,5,6);
+  }else if(wkey==="pistol"){
+    // 권총: 짧은 총신
+    ctx.strokeStyle="#d8e0e8";ctx.lineWidth=3;
+    ctx.beginPath();ctx.moveTo(br,0);ctx.lineTo(e.r+10,0);ctx.stroke();
+    ctx.fillStyle="#8090a0";
+    ctx.fillRect(br,2,4,6);
+  }else if(wkey==="knife"){
+    // 칼: 삼각형 칼날
+    ctx.strokeStyle="#dde8f0";ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.moveTo(br,-3);ctx.lineTo(e.r+13,0);ctx.lineTo(br,3);ctx.closePath();ctx.stroke();
+    ctx.fillStyle="rgba(200,215,230,0.45)";ctx.fill();
+  }
+  // 머리
+  ctx.fillStyle="rgba(255,255,255,0.85)";
+  ctx.beginPath();ctx.arc(0,0,e.headR,0,TAU);ctx.fill();
+  ctx.restore();
+  // HP 바
+  const w=30,hpr=clamp(e.hp/CONFIG.player.hp,0,1);
+  ctx.fillStyle="rgba(0,0,0,0.5)";
+  ctx.fillRect(e.x-w/2,e.y-e.r-12,w,4);
+  ctx.fillStyle=e.team===0?"#5bd68a":"#e05252";
+  ctx.fillRect(e.x-w/2,e.y-e.r-12,w*hpr,4);
+  // 이름
+  ctx.font="10px sans-serif";ctx.textAlign="center";
+  ctx.fillStyle="rgba(255,255,255,0.75)";
+  ctx.fillText(e.name,e.x,e.y-e.r-16);
+  // 장전 표시
+  if(e.reloading>0){
+    ctx.fillStyle="#ffd66b";
+    ctx.fillText("장전중...",e.x,e.y+e.r+16);
+  }
+}
+
+function hudPanel(x,y,w,h){
+  ctx.fillStyle="rgba(8,12,18,0.72)";
+  ctx.strokeStyle="rgba(255,255,255,0.07)";
+  ctx.lineWidth=1;
+  ctx.beginPath();
+  ctx.moveTo(x+5,y);ctx.lineTo(x+w-5,y);ctx.arcTo(x+w,y,x+w,y+5,5);
+  ctx.lineTo(x+w,y+h-5);ctx.arcTo(x+w,y+h,x+w-5,y+h,5);
+  ctx.lineTo(x+5,y+h);ctx.arcTo(x,y+h,x,y+h-5,5);
+  ctx.lineTo(x,y+5);ctx.arcTo(x,y,x+5,y,5);
+  ctx.closePath();
+  ctx.fill();ctx.stroke();
+}
+
+function renderHUD(){
+  const aliveT0=entities.filter(e=>e.team===0&&e.alive);
+  const aliveT1=entities.filter(e=>e.team===1&&e.alive);
+  const aC=aliveT0.length, bC=aliveT1.length;
+
+  // ══════════════════════════════════════════
+  // 상단 중앙: 라운드 스코어 + 생존 인원 도트
+  // ══════════════════════════════════════════
+  const topW=260,topH=54,topX=W/2-topW/2,topY=10;
+  hudPanel(topX,topY,topW,topH);
+
+  // 스코어
+  ctx.textAlign="center";
+  ctx.font="bold 28px monospace";
+  ctx.fillStyle="#e8eef5";
+  {const _ms=player?round.scores[player.team]:round.scores[0];const _ts=player?round.scores[1-player.team]:round.scores[1];ctx.fillText(`${_ms}  :  ${_ts}`,W/2,topY+30);}
+
+  // 생존 도트 — 팀0(좌) 팀1(우)
+  const dotR=4,dotGap=12;
+  for(let i=0;i<3;i++){
+    const alive=aliveT0.length>i;
+    ctx.fillStyle=alive?"#5bb8ff":"rgba(91,184,255,0.18)";
+    ctx.beginPath();ctx.arc(W/2-68+(i*dotGap),topY+46,dotR,0,TAU);ctx.fill();
+  }
+  ctx.fillStyle="rgba(255,255,255,0.28)";ctx.font="10px monospace";
+  ctx.fillText(`R${round.n}`,W/2,topY+48);
+  for(let i=0;i<3;i++){
+    const alive=aliveT1.length>i;
+    ctx.fillStyle=alive?"#ff6060":"rgba(255,96,96,0.18)";
+    ctx.beginPath();ctx.arc(W/2+44+(i*dotGap),topY+46,dotR,0,TAU);ctx.fill();
+  }
+
+  // ══════════════════════════════════════════
+  // 좌하단: HP
+  // ══════════════════════════════════════════
+  if(player){
+    const hpPx=180,hpH=12;
+    const px=20,py=H-72;
+    hudPanel(px,py,224,62);
+
+    const hpR=clamp(player.hp/CONFIG.player.hp,0,1);
+    const hpColor=player.hp>50?"#4cd47a":(player.hp>25?"#f0c040":"#e84040");
+    ctx.fillStyle="#9fb3c8";ctx.font="11px monospace";ctx.textAlign="left";
+    ctx.fillText("HP",px+12,py+18);
+    ctx.fillStyle=`rgba(255,255,255,${player.hp<=25?0.9:0.2})`;
+    ctx.font=`bold ${player.hp<=25?16:13}px monospace`;
+    ctx.textAlign="right";
+    ctx.fillStyle=hpColor;
+    ctx.fillText(Math.ceil(player.hp),px+212,py+20);
+
+    // HP 바 배경
+    ctx.fillStyle="rgba(255,255,255,0.08)";
+    ctx.fillRect(px+12,py+28,hpPx,hpH);
+    // HP 바 채우기
+    ctx.fillStyle=hpColor;
+    ctx.fillRect(px+12,py+28,hpPx*hpR,hpH);
+    // HP 낮을 때 경고선
+    if(player.hp<=25){
+      ctx.strokeStyle=`rgba(232,64,64,${0.4+Math.sin(performance.now()/200)*0.3})`;
+      ctx.lineWidth=1.5;
+      ctx.strokeRect(px+12,py+28,hpPx,hpH);
+    }
+
+    // 구르기 쿨다운
+    ctx.fillStyle="rgba(255,255,255,0.08)";
+    ctx.fillRect(px+12,py+48,hpPx,5);
+    const rollFill=roll.cd<=0?1:1-roll.cd/CONFIG.roll.cooldown;
+    ctx.fillStyle=roll.cd<=0?"#5ba0ff":"#3a4e6a";
+    ctx.fillRect(px+12,py+48,hpPx*rollFill,5);
+    ctx.fillStyle="rgba(159,179,200,0.5)";ctx.font="9px monospace";ctx.textAlign="left";
+    ctx.fillText("ROLL",px+12,py+60);
+    ctx.textAlign="right";
+    ctx.fillText(roll.cd<=0?"READY":`${roll.cd.toFixed(1)}s`,px+195,py+60);
+  }
+
+  // ══════════════════════════════════════════
+  // 우하단: 무기 + 탄약
+  // ══════════════════════════════════════════
+  if(player){
+    const wp=weaponOf(player);
+    const ww=200,wh=84,wx=W-ww-20,wy=H-wh-20;
+    hudPanel(wx,wy,ww,wh);
+
+    // 무기 이름
+    ctx.textAlign="left";
+    ctx.font="bold 14px monospace";
+    ctx.fillStyle="#9fb3c8";
+    ctx.fillText(wp.name,wx+14,wy+22);
+
+    // 탄약 수치
+    if(!wp.melee){
+      const am=player.ammo[player.weaponKey];
+      const lowAmmo=am.mag<=Math.floor(wp.mag*0.3);
+      // 현재 탄창 (큰 숫자)
+      ctx.font=`bold 36px monospace`;
+      ctx.fillStyle=lowAmmo?"#f06060":"#e8eef5";
+      ctx.textAlign="right";
+      ctx.fillText(am.mag,wx+ww-60,wy+62);
+      // 구분선
+      ctx.fillStyle="rgba(255,255,255,0.25)";
+      ctx.font="bold 28px monospace";
+      ctx.fillText("/",wx+ww-50,wy+60);
+      // 예비 탄약
+      ctx.font="bold 20px monospace";
+      ctx.fillStyle="rgba(180,195,210,0.7)";
+      ctx.fillText(am.reserve,wx+ww-14,wy+62);
+
+      // 장전 진행 바
+      if(player.reloading>0){
+        const rProg=1-player.reloading/wp.reloadTime;
+        ctx.fillStyle="rgba(255,255,255,0.1)";
+        ctx.fillRect(wx+14,wy+70,ww-28,5);
+        ctx.fillStyle="#f0c040";
+        ctx.fillRect(wx+14,wy+70,(ww-28)*rProg,5);
+        ctx.font="9px monospace";ctx.textAlign="left";
+        ctx.fillStyle="#f0c040";
+        ctx.fillText("RELOADING",wx+14,wy+82);
+      }
+    }else{
+      ctx.font="bold 20px monospace";
+      ctx.fillStyle="#e8eef5";
+      ctx.textAlign="center";
+      ctx.fillText("근접 무기",wx+ww/2,wy+58);
+    }
+  }
+
+  // ══════════════════════════════════════════
+  // 우상단: 킬피드
+  // ══════════════════════════════════════════
+  ctx.textAlign="right";
+  feed.forEach((f,i)=>{
+    const a=clamp(f.t,0,1);
+    // 배경
+    const tw=ctx.measureText(f.text).width+20;
+    ctx.fillStyle=`rgba(0,0,0,${a*0.5})`;
+    ctx.fillRect(W-tw-10,14+i*22,tw,18);
+    // 텍스트 색: 헤드샷은 노란색
+    const isHead=f.text.includes("[헤드샷]");
+    const isKill=f.text.includes("☠");
+    ctx.font=`${isKill?"bold ":""}13px sans-serif`;
+    ctx.fillStyle=isHead?`rgba(255,220,80,${a})`:`rgba(210,225,240,${a})`;
+    ctx.fillText(f.text,W-14,28+i*22);
+  });
+
+  // ══════════════════════════════════════════
+  // 크로스헤어 (스코프 중에는 숨김)
+  // ══════════════════════════════════════════
+  if(player&&player.alive&&!scoped){
+    const wp=weaponOf(player);
+    let spread=wp.melee?0:(wp.spread+(player.moveMag||0)*wp.moveSpread+player.recoil);
+    if(mouse.r&&!wp.melee)spread*=CONFIG.focus.spreadMult;
+    const gap=4+spread*420;
+    ctx.strokeStyle="rgba(255,255,255,0.85)";ctx.lineWidth=1.5;
+    const mx=mouse.x,my=mouse.y,l=6;
+    ctx.beginPath();
+    ctx.moveTo(mx-gap-l,my);ctx.lineTo(mx-gap,my);
+    ctx.moveTo(mx+gap,my);  ctx.lineTo(mx+gap+l,my);
+    ctx.moveTo(mx,my-gap-l);ctx.lineTo(mx,my-gap);
+    ctx.moveTo(mx,my+gap);  ctx.lineTo(mx,my+gap+l);
+    ctx.stroke();
+    // 히트마커
+    if(hitMarker>0){
+      ctx.strokeStyle=`rgba(255,60,60,${hitMarker/0.12})`;ctx.lineWidth=2;
+      ctx.beginPath();
+      ctx.moveTo(mx-8,my-8);ctx.lineTo(mx-3,my-3);
+      ctx.moveTo(mx+8,my-8);ctx.lineTo(mx+3,my-3);
+      ctx.moveTo(mx-8,my+8);ctx.lineTo(mx-3,my+3);
+      ctx.moveTo(mx+8,my+8);ctx.lineTo(mx+3,my+3);
+      ctx.stroke();
+    }
+  }else if(player&&!player.alive){
+    ctx.fillStyle="rgba(180,190,200,0.65)";ctx.font="13px sans-serif";ctx.textAlign="center";
+    ctx.fillText("사망 — 관전 중",W/2,H-28);
+  }
+
+  // ══════════════════════════════════════════
+  // 스크린 이펙트
+  // ══════════════════════════════════════════
+  if(hitFlash>0){
+    ctx.fillStyle=`rgba(220,30,30,${hitFlash*0.38})`;
+    ctx.fillRect(0,0,W,H);
+    ctx.strokeStyle=`rgba(220,30,30,${hitFlash*0.6})`;
+    ctx.lineWidth=8;ctx.strokeRect(0,0,W,H);
+  }
+  if(killFlash>0){
+    ctx.fillStyle=`rgba(60,210,110,${killFlash*0.22})`;
+    ctx.fillRect(0,0,W,H);
+    ctx.strokeStyle=`rgba(60,210,110,${killFlash*0.65})`;
+    ctx.lineWidth=5;ctx.strokeRect(3,3,W-6,H-6);
+  }
+  if(killSlowT>0){
+    const ka=killSlowT/CONFIG.killEffect.slowDur;
+    ctx.fillStyle=`rgba(60,210,110,${ka*0.55})`;
+    ctx.font="bold 28px monospace";ctx.textAlign="center";
+    ctx.fillText("KILL",W/2,H/2-8);
+  }
+
+  // ══════════════════════════════════════════
+  // 라운드 배너
+  // ══════════════════════════════════════════
+  if(round.state==="pre"){
+    ctx.fillStyle="rgba(0,0,0,0.6)";ctx.fillRect(0,H/2-55,W,110);
+    ctx.strokeStyle="rgba(255,255,255,0.06)";ctx.lineWidth=1;
+    ctx.strokeRect(0,H/2-55,W,110);
+    ctx.font="bold 44px monospace";ctx.textAlign="center";
+    ctx.fillStyle="#dde4ec";
+    ctx.fillText(`ROUND  ${round.n}`,W/2,H/2+16);
+  }else if(round.state==="end"){
+    const win=round.msg.includes("승리");
+    ctx.fillStyle="rgba(0,0,0,0.65)";ctx.fillRect(0,H/2-65,W,130);
+    ctx.font="bold 42px sans-serif";ctx.textAlign="center";
+    ctx.fillStyle=win?"#4cd47a":"#e84040";
+    ctx.fillText(round.msg,W/2,H/2+6);
+    ctx.font="16px monospace";ctx.fillStyle="rgba(180,195,210,0.8)";
+    {const _ms=player?round.scores[player.team]:round.scores[0];const _ts=player?round.scores[1-player.team]:round.scores[1];ctx.fillText(`${_ms}  —  ${_ts}`,W/2,H/2+36);}
+  }
+
+  // ══════════════════════════════════════════
+  // 조작 힌트 (좌하단 하단, 작게)
+  // ══════════════════════════════════════════
+  ctx.textAlign="left";ctx.font="10px monospace";ctx.fillStyle="rgba(120,140,160,0.4)";
+  ctx.fillText("WASD · Shift · Space · 우클릭 · R · 1/2/3 · F1",24,H-8);
+}
+
+/* ===================== 온라인 멀티플레이어 ===================== */
+let _hbInt=null;
+function _startHB(){
+  _stopHB();
+  _hbInt=setInterval(()=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'ping'}));},25000);
+}
+function _stopHB(){if(_hbInt){clearInterval(_hbInt);_hbInt=null;}}
+
+function connectToServer(){
+  if(ws){ws.close();ws=null;}
+  netState="connecting";
+  try{
+    ws=new WebSocket(SERVER_URL);
+    ws.onopen=()=>{netState="lobby";_startHB();};
+    ws.onerror=()=>{netState="error";};
+    ws.onclose=()=>{
+      _stopHB();
+      if(netState==="playing"){addFeed("상대방 연결 끊김");netState="disconnected";}
+      else if(netState!=="idle")netState="error";
+    };
+    ws.onmessage=handleNetMessage;
+  }catch(e){netState="error";}
+}
+
+function handleNetMessage(ev){
+  let msg;try{msg=JSON.parse(ev.data);}catch{return;}
+  switch(msg.type){
+    case 'created': lobbyCode=msg.code; netState="waiting"; break;
+    case 'joined':  netState="waiting"; break;
+    case 'start':   mySlot=msg.yourSlot; round.n=0; round.scores=[0,0]; startOnlineGame(); break;
+    case 'state':   if(remoteEntity)updateRemoteEntity(msg); break;
+    case 'hit':     if(player&&player.alive)applyDamage(player,msg.dmg,msg.head,remoteEntity); break;
+    case 'shot':    handleRemoteShot(msg); break;
+    case 'restart': if(netState==="playing")startOnlineGame(); break;
+    case 'pong':    break;
+    case 'disconnect': addFeed("상대방 연결 끊김"); netState="disconnected"; break;
+    case 'error':   addFeed(msg.msg||"연결 오류"); netState="lobby"; break;
+  }
+}
+
+function startOnlineGame(){
+  netState="playing";
+  entities.length=0;corpses.length=0;drops.length=0;rings.length=0;floatTexts.length=0;
+  tracers.length=0;particles.length=0;flashes.length=0;bloodStains.length=0;
+  scoped=false;scopeZoom=3.2;killSlowT=0;killFlash=0;timeScale=1;
+  roll={active:false,t:0,dirX:0,dirY:0,cd:0};
+
+  const sp=spawns[mySlot][1];
+  player=makeEntity(mySlot,sp.x,sp.y,false,"나");
+  player.weaponKey=chosenWeapon;
+  if(chosenWeapon==="awp"){
+    player.ammo={awp:{mag:CONFIG.weapons.awp.mag,reserve:CONFIG.weapons.awp.reserve},
+                 pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}};
+    player.prevKey="pistol";
+  }else if(chosenWeapon==="smg"){
+    player.ammo={smg:{mag:CONFIG.weapons.smg.mag,reserve:CONFIG.weapons.smg.reserve},
+                 pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}};
+    player.prevKey="pistol";
+  }else{
+    player.ammo={ak:{mag:CONFIG.weapons.ak.mag,reserve:CONFIG.weapons.ak.reserve},
+                 pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}};
+  }
+  entities.push(player);
+
+  const rsp=spawns[1-mySlot][1];
+  remoteEntity=makeEntity(1-mySlot,rsp.x,rsp.y,false,"상대");
+  remoteEntity.isBot=false;
+  entities.push(remoteEntity);
+
+  round.n++;round.state="play";round.t=0;
+  gameState="game";
+  addFeed("게임 시작! 상대방과 연결됨");
+}
+
+function sendPlayerState(){
+  if(!ws||ws.readyState!==1||!player)return;
+  ws.send(JSON.stringify({
+    type:'state',
+    x:Math.round(player.x),y:Math.round(player.y),
+    angle:+player.angle.toFixed(3),
+    hp:player.hp,alive:player.alive,
+    wk:player.weaponKey,reload:player.reloading>0
+  }));
+}
+
+function updateRemoteEntity(msg){
+  if(!remoteEntity)return;
+  remoteEntity.x=msg.x; remoteEntity.y=msg.y; remoteEntity.angle=msg.angle;
+  remoteEntity.hp=msg.hp; remoteEntity.weaponKey=msg.wk||remoteEntity.weaponKey;
+  remoteEntity.reloading=msg.reload?1:0;
+  if(msg.alive===false&&remoteEntity.alive){
+    remoteEntity.alive=false;remoteEntity.hp=0;
+    corpses.push({x:remoteEntity.x,y:remoteEntity.y,angle:remoteEntity.angle,team:remoteEntity.team,weapon:remoteEntity.weaponKey,age:0});
+    sfx.death();
+    addFeed("나 ☠ 상대");
+  }else if(msg.alive!==false&&!remoteEntity.alive){
+    remoteEntity.alive=true;remoteEntity.hp=msg.hp;
+  }
+}
+
+function handleRemoteShot(msg){
+  if(!remoteEntity)return;
+  sfx.shot(msg.wk,volByDist(remoteEntity));
+  const tLife=rand(0.8,1.0);
+  tracers.push({x1:msg.ox,y1:msg.oy,x2:msg.ex,y2:msg.ey,t:tLife,life:tLife});
+  flashes.push({x:msg.ox,y:msg.oy,ang:Math.atan2(msg.ey-msg.oy,msg.ex-msg.ox),t:0.05});
+  emitNoise(msg.ox,msg.oy,CONFIG.weapons[msg.wk]?.noise||500,remoteEntity.team,"shot");
+}
+
+/* -------- 로비 UI -------- */
+function drawBtn(x,y,w,h,label,col){
+  const hov=inBtn(x,y,w,h);
+  ctx.fillStyle=hov?col+"cc":col+"55";
+  ctx.strokeStyle=hov?col+"ff":col+"99";
+  ctx.lineWidth=1.5;
+  rr(x,y,w,h,8);ctx.fill();ctx.stroke();
+  ctx.font="bold 14px monospace";ctx.textAlign="center";
+  ctx.fillStyle=hov?"#ffffff":col+"ee";
+  ctx.fillText(label,x+w/2,y+h/2+5);
+}
+function renderLobby(){
+  ctx.textAlign="center";
+  // 타이틀
+  ctx.font="bold 38px monospace";ctx.fillStyle="#dfe6ef";
+  ctx.fillText("온라인 대전",W/2,H/2-180);
+  ctx.font="13px sans-serif";ctx.fillStyle="#5a7a8a";
+  ctx.fillText("방 코드를 상대방과 공유하여 1 vs 1 대전",W/2,H/2-146);
+
+  // 무기 선택
+  ctx.font="11px sans-serif";ctx.fillStyle="#3a5a6a";ctx.fillText("무기 선택",W/2,H/2-123);
+  const _lbwChoices=[{key:"ak",label:"AK-47"},{key:"smg",label:"SMG"},{key:"awp",label:"AWP"}];
+  _lbwChoices.forEach((wc,i)=>{
+    const bx=W/2-150+i*100,by=H/2-115;
+    const sel=chosenWeapon===wc.key||(wc.key==="ak"&&!["awp","smg"].includes(chosenWeapon));
+    ctx.fillStyle=sel?"rgba(60,140,220,0.35)":"rgba(20,40,60,0.45)";
+    ctx.strokeStyle=sel?"#5ab0ee":"#2a4a6a";ctx.lineWidth=sel?2:1;
+    rr(bx,by,90,34,6);ctx.fill();ctx.stroke();
+    ctx.font=(sel?"bold ":"")+"13px monospace";ctx.textAlign="center";
+    ctx.fillStyle=sel?"#88d8ff":"#4a7a9a";
+    ctx.fillText(wc.label,bx+45,by+22);
+  });
+  ctx.strokeStyle="rgba(80,110,140,0.2)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(W/2-200,H/2-72);ctx.lineTo(W/2+200,H/2-72);ctx.stroke();
+
+  if(netState==="connecting"){
+    ctx.font="18px sans-serif";ctx.fillStyle="#6a8aaa";
+    ctx.fillText("서버 연결 중...",W/2,H/2-20);
+    const d=Date.now()/1000;
+    for(let i=0;i<8;i++){
+      const a=i/8*TAU+d*2;
+      ctx.fillStyle=`rgba(80,160,220,${0.3+0.7*(i/8)})`;
+      ctx.beginPath();ctx.arc(W/2+Math.cos(a)*28,H/2+28+Math.sin(a)*28,4,0,TAU);ctx.fill();
+    }
+  }else if(netState==="error"){
+    ctx.font="16px sans-serif";ctx.fillStyle="#c06060";
+    ctx.fillText("서버 연결 실패",W/2,H/2-40);
+    ctx.font="12px sans-serif";ctx.fillStyle="#7a5050";
+    ctx.fillText(SERVER_URL,W/2,H/2-18);
+    drawBtn(W/2-100,H/2+10,200,44,"다시 시도","#884444");
+  }else if(netState==="lobby"){
+    ctx.font="13px sans-serif";ctx.fillStyle="#4a6a7a";
+    ctx.fillText("방을 만들거나 상대방 코드를 입력하세요",W/2,H/2-50);
+    drawBtn(W/2-200,H/2-20,185,52,"방 만들기","#2a5a9a");
+    drawBtn(W/2+15,H/2-20,185,52,"방 참가","#1a6040");
+    if(lobbyInputMode){
+      ctx.fillStyle="rgba(8,18,28,0.95)";ctx.strokeStyle="#3a6a8a";ctx.lineWidth=1.5;
+      rr(W/2-150,H/2+48,300,52,8);ctx.fill();ctx.stroke();
+      ctx.font="bold 26px monospace";ctx.fillStyle="#9fd8ff";
+      const blink=Math.floor(Date.now()/500)%2?"▌":"";
+      ctx.fillText((lobbyInput||"")+blink,W/2,H/2+82);
+      ctx.font="11px sans-serif";ctx.fillStyle="#4a7a9a";
+      ctx.fillText("코드 입력 후 Enter",W/2,H/2+112);
+    }
+  }else if(netState==="waiting"){
+    ctx.font="14px sans-serif";ctx.fillStyle="#5a8a9a";
+    ctx.fillText("이 코드를 상대방에게 알려주세요",W/2,H/2-80);
+    // 큰 코드 표시
+    ctx.fillStyle="rgba(10,20,30,0.85)";ctx.strokeStyle="#4a8aaa";ctx.lineWidth=1.5;
+    rr(W/2-160,H/2-60,320,80,12);ctx.fill();ctx.stroke();
+    ctx.font="bold 62px monospace";ctx.fillStyle="#f0e060";
+    ctx.letterSpacing="8px";
+    ctx.fillText(lobbyCode,W/2,H/2+14);
+    ctx.letterSpacing="0px";
+    // 대기 애니메이션
+    const dots=[" ","."," .","  ."," . ."][Math.floor(Date.now()/400)%5];
+    ctx.font="15px sans-serif";ctx.fillStyle="#5a8a9a";
+    ctx.fillText("상대방 대기 중"+dots,W/2,H/2+62);
+  }else if(netState==="disconnected"){
+    ctx.font="16px sans-serif";ctx.fillStyle="#c08060";
+    ctx.fillText("상대방이 연결을 끊었습니다",W/2,H/2-20);
+    drawBtn(W/2-100,H/2+20,200,44,"다시 연결","#885533");
+  }
+
+  // 뒤로가기
+  drawBtn(W/2-90,H/2+160,180,40,"← 뒤로가기","#2a3a4a");
+  ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,3,0,TAU);ctx.fill();
+}
+/* ===================== 온라인 끝 ===================== */
+
+function rr(x,y,w,h,r){
+  ctx.beginPath();ctx.moveTo(x+r,y);ctx.lineTo(x+w-r,y);
+  ctx.arcTo(x+w,y,x+w,y+r,r);ctx.lineTo(x+w,y+h-r);
+  ctx.arcTo(x+w,y+h,x+w-r,y+h,r);ctx.lineTo(x+r,y+h);
+  ctx.arcTo(x,y+h,x,y+h-r,r);ctx.lineTo(x,y+r);
+  ctx.arcTo(x,y,x+r,y,r);ctx.closePath();
+}
+
+function renderMenu(){
+  ctx.textAlign="center";
+  // 타이틀
+  ctx.fillStyle="#dfe6ef";
+  ctx.font="bold 58px monospace";
+  ctx.fillText("BLOCK WAR",W/2,H/2-168);
+  ctx.font="13px sans-serif";ctx.fillStyle="#6a8a9a";
+  ctx.fillText("적을 찾아라  ·  들어라  ·  예측하라  ·  먼저 쏴라",W/2,H/2-124);
+
+  // 구분선
+  ctx.strokeStyle="rgba(80,110,140,0.35)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(W/2-220,H/2-106);ctx.lineTo(W/2+220,H/2-106);ctx.stroke();
+
+  const bw=480,bh=70,bx=W/2-bw/2;
+  ctx.font="bold 12px monospace";ctx.fillStyle="#4a6070";
+  ctx.fillText("▲ ▼  모드 선택     Enter 또는 클릭",W/2,H/2-90);
+
+  gameModes.forEach((m,i)=>{
+    const by=H/2-78+i*84;
+    const sel=i===menuModeIdx;
+    const dim=!m.ready;
+    // 배경 박스
+    ctx.fillStyle=sel&&m.ready?"#0e1d2e":(sel?"rgba(18,22,28,0.7)":"rgba(12,16,22,0.6)");
+    ctx.strokeStyle=sel&&m.ready?"#3a80cc":(sel?"#2a3a4a":"#1e2a38");
+    ctx.lineWidth=sel?2:1;
+    rr(bx,by,bw,bh,10);ctx.fill();ctx.stroke();
+    // 좌측 악센트 바
+    if(sel&&m.ready){
+      ctx.fillStyle="#3a80cc";
+      rr(bx,by+12,4,bh-24,2);ctx.fill();
+    }
+    // 모드명
+    ctx.textAlign="left";
+    ctx.font=`bold ${sel?22:19}px monospace`;
+    ctx.fillStyle=dim?"#3a4a5a":(sel?"#7ab8ee":"#8aa8c8");
+    ctx.fillText(m.label,bx+24,by+30);
+    // 설명
+    ctx.font="12px sans-serif";
+    ctx.fillStyle=dim?"#2e3a46":"#445566";
+    ctx.fillText(m.desc,bx+24,by+52);
+    // 준비중 뱃지
+    if(dim){
+      ctx.font="bold 10px monospace";ctx.fillStyle="#334455";
+      const tw=ctx.measureText("준비중").width+16;
+      ctx.fillStyle="rgba(40,55,70,0.9)";
+      rr(bx+bw-tw-14,by+24,tw,22,4);ctx.fill();
+      ctx.fillStyle="#4a6070";ctx.font="bold 10px monospace";ctx.textAlign="left";
+      ctx.fillText("준비중",bx+bw-tw-6,by+39);
+    }
+    // 선택 화살표
+    if(sel&&m.ready){
+      ctx.textAlign="right";
+      ctx.font="bold 20px monospace";ctx.fillStyle="#3a80cc";
+      ctx.fillText("▶",bx+bw-16,by+44);
+    }
+    ctx.textAlign="center";
+  });
+
+  ctx.font="11px sans-serif";ctx.fillStyle="rgba(60,80,100,0.7)";
+  ctx.fillText("© BLOCK WAR ALPHA  —  eser.lbs@gmail.com",W/2,H-24);
+  ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,3,0,TAU);ctx.fill();
+}
+
+function renderPause(){
+  // 반투명 오버레이
+  ctx.fillStyle="rgba(0,0,0,0.72)";
+  ctx.fillRect(0,0,W,H);
+  // 패널
+  const pw=320,ph=220,px=W/2-pw/2,py=H/2-ph/2;
+  ctx.fillStyle="rgba(10,16,24,0.97)";
+  ctx.strokeStyle="#2a3e56";ctx.lineWidth=1.5;
+  rr(px,py,pw,ph,12);ctx.fill();ctx.stroke();
+  // 상단 강조선
+  ctx.fillStyle="#2a5a8a";
+  rr(px+1,py+1,pw-2,4,2);ctx.fill();
+  // 제목
+  ctx.textAlign="center";
+  ctx.font="bold 22px monospace";ctx.fillStyle="#8ab8d8";
+  ctx.fillText("일시 정지",W/2,py+50);
+  // 구분선
+  ctx.strokeStyle="rgba(60,90,120,0.4)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(px+30,py+66);ctx.lineTo(px+pw-30,py+66);ctx.stroke();
+  // 계속하기 버튼
+  const bw=280,bx2=W/2-bw/2;
+  const hov1=mouse.x>=bx2&&mouse.x<=bx2+bw&&mouse.y>=H/2-10&&mouse.y<=H/2+40;
+  const hov2=mouse.x>=bx2&&mouse.x<=bx2+bw&&mouse.y>=H/2+54&&mouse.y<=H/2+104;
+  ctx.fillStyle=hov1?"rgba(30,70,110,0.95)":"rgba(20,50,80,0.9)";
+  ctx.strokeStyle=hov1?"#4a8aca":"#2a6aaa";ctx.lineWidth=1.5;
+  rr(bx2,H/2-10,bw,50,8);ctx.fill();ctx.stroke();
+  ctx.font="bold 16px monospace";ctx.fillStyle=hov1?"#aadeff":"#6ab4e8";
+  ctx.fillText("계속하기",W/2,H/2+20);
+  // 메인메뉴 버튼
+  ctx.fillStyle=hov2?"rgba(60,25,25,0.95)":"rgba(30,20,20,0.9)";
+  ctx.strokeStyle=hov2?"#8a3a3a":"#5a2a2a";ctx.lineWidth=1.5;
+  rr(bx2,H/2+54,bw,50,8);ctx.fill();ctx.stroke();
+  ctx.font="bold 16px monospace";ctx.fillStyle=hov2?"#e08080":"#c06060";
+  ctx.fillText("← 메인 메뉴",W/2,H/2+84);
+  // ESC 힌트
+  ctx.font="11px sans-serif";ctx.fillStyle="rgba(80,100,120,0.7)";
+  ctx.fillText("ESC — 계속하기",W/2,py+ph-16);
+  // 커서 표시 (게임중 커서 숨겨지므로 명시적으로 렌더)
+  ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,4,0,TAU);ctx.fill();
+  ctx.fillStyle="#0af";ctx.beginPath();ctx.arc(mouse.x,mouse.y,2,0,TAU);ctx.fill();
+}
+
+function renderTitle(){
+  ctx.textAlign="center";
+  ctx.fillStyle="#dfe6ef";
+  ctx.font="bold 46px monospace";
+  ctx.fillText("대전 모드 — 무기 선택",W/2,H/2-148);
+  ctx.font="13px sans-serif";ctx.fillStyle="#6a8a9a";
+  ctx.fillText("▲ ▼ 무기 선택    Enter 또는 클릭으로 시작",W/2,H/2-108);
+
+  const bw=420,bh=60,bx=W/2-bw/2;
+  weaponChoices.forEach((wc,i)=>{
+    const by=H/2-60+i*76;
+    const sel=i===titleWeaponIdx;
+    ctx.fillStyle=sel?"#1a2a3a":"rgba(20,26,34,0.7)";
+    ctx.strokeStyle=sel?"#5ba0ff":"#334455";
+    ctx.lineWidth=sel?2.5:1;
+    rr(bx,by,bw,bh,8);ctx.fill();ctx.stroke();
+    if(sel){ctx.fillStyle="#5ba0ff";rr(bx,by+10,4,bh-20,2);ctx.fill();}
+    ctx.textAlign="left";
+    ctx.font=`bold ${sel?20:17}px monospace`;
+    ctx.fillStyle=sel?"#5ba0ff":"#9fb3c8";
+    ctx.fillText(wc.label,bx+22,by+26);
+    ctx.font="12px sans-serif";ctx.fillStyle=sel?"#8ab4d4":"#556677";
+    ctx.fillText(wc.desc,bx+22,by+45);
+    if(sel){
+      ctx.textAlign="right";
+      ctx.font="bold 18px monospace";ctx.fillStyle="#5ba0ff";
+      ctx.fillText("▶",bx+bw-16,by+36);
+    }
+    ctx.textAlign="center";
+  });
+
+  ctx.font="12px sans-serif";ctx.fillStyle="rgba(70,90,110,0.7)";ctx.textAlign="center";
+  ctx.fillText("WASD 이동  ·  Shift 걷기  ·  Space 구르기  ·  F 줍기  ·  G 버리기  ·  ESC 일시정지",W/2,H/2+190);
+
+  // 뒤로가기 버튼
+  const bbw=160,bbh=38,bbx=W/2-bbw/2,bby=H/2+214;
+  const bbHov=mouse.x>=bbx&&mouse.x<=bbx+bbw&&mouse.y>=bby&&mouse.y<=bby+bbh;
+  ctx.fillStyle=bbHov?"rgba(30,45,60,0.95)":"rgba(16,24,34,0.85)";
+  ctx.strokeStyle=bbHov?"#3a6080":"#233040";ctx.lineWidth=1.5;
+  rr(bbx,bby,bbw,bbh,6);ctx.fill();ctx.stroke();
+  ctx.font="bold 13px monospace";ctx.fillStyle=bbHov?"#7ab8e0":"#4a7090";
+  ctx.fillText("← 뒤로가기",W/2,bby+24);
+
+  ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,3,0,TAU);ctx.fill();
+}
+
+loop();
+</script>
+</body>
+</html>
