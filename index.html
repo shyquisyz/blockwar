@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="ko">
 <head>
 <meta charset="utf-8">
@@ -60,7 +60,7 @@ const CONFIG = {
               range:46, arc:90*RAD, noise:120, speedMult:1.22, rollMult:1.65 }
   },
   killEffect: { slowDur:0.22, slowScale:0.15 },
-  round: { preTime: 2.0, buyTime: 10.0, endTime: 0.5, resultTime: 3.2 },
+  round: { preTime: 1.0, buyTime: 7.0, endTime: 0.4, resultTime: 2.2 },
   economy: { start:1000, win:500, loss:300, kill:200, head:100, knife:200 },
   world: { w: 1800, h: 1200 },
   debug: false   // F1 토글: 봇 상태/시야 표시
@@ -69,9 +69,16 @@ const CONFIG = {
 /* ---------------- 네트워크 설정 ---------------- */
 const SERVER_URL = "wss://blockwar.onrender.com";
 let ws = null;
-let mySlot = -1;         // -1=오프라인, 0=왼쪽, 1=오른쪽
-let remoteEntity = null;
-let netState = "idle";   // idle|connecting|lobby|waiting|playing|error|disconnected
+let mySlot = -1;          // -1=오프라인, 0/1/2=슬롯
+let remoteEntity = null;  // 1v1 전용 (하위 호환)
+let remoteEntities = {};  // slot→entity (협동 포함 전체)
+let gameMode = "1v1";     // "1v1"|"coop2"|"coop3"
+let netMaxSlots = 2;
+let isCoopHost = false;   // 협동 모드에서 슬롯0(봇 AI 담당)
+let coopBotTimer = 0;
+let lobbyFilledSlots = 1;
+let lobbyGameMode = "1v1";// 로비에서 선택한 모드
+let netState = "idle";    // idle|connecting|lobby|waiting|playing|error|disconnected
 let lobbyCode = "";
 let lobbyInput = "";
 let lobbyInputMode = false;
@@ -173,8 +180,8 @@ const waypoints = [
   {x:800, y:540},  // Mid center
 ];
 const spawns = {
-  0:[{x:95, y:580},{x:95, y:680},{x:95, y:780}],    // T (좌측)
-  1:[{x:1670,y:420},{x:1670,y:520},{x:1670,y:620}]  // CT (우측, 개방형)
+  0:[{x:95, y:580},{x:95, y:680},{x:95, y:780}],              // T (좌측, 최대 3인)
+  1:[{x:1670,y:420},{x:1670,y:520},{x:1670,y:620},{x:1670,y:720}] // CT (우측, 최대 4봇)
 };
 // 팀별 구매구역 (진영 내 사각형)
 const BUY_ZONES = [
@@ -483,12 +490,29 @@ function fireHitscan(shooter,wp,ang){
     ex=ox+dx*best.t;ey=oy+dy*best.t;
     const head=best.dd<best.e.headR;
     const dmg=head?wp.dmg*wp.headMult:wp.dmg;
-    // 온라인: 원격 플레이어 피격 → 이벤트 전송
-    if(best.e===remoteEntity&&ws&&ws.readyState===1){
-      ws.send(JSON.stringify({type:'hit',dmg,head}));
-    }else{
-      applyDamage(best.e,dmg,head,shooter);
+    let skipApply=false;
+    if(ws&&ws.readyState===1){
+      if(gameMode==="1v1"&&shooter===player&&best.e===remoteEntity){
+        // 1v1: 상대방 피격 → 서버로 전송
+        ws.send(JSON.stringify({type:'hit',dmg,head}));
+        skipApply=true;
+      }else if(gameMode!=="1v1"&&!isCoopHost&&shooter===player&&best.e.team===1){
+        // 협동 게스트: 봇 피격 → 호스트에게 전송 (호스트가 권한)
+        const botIdx=entities.filter(e=>e.team===1).indexOf(best.e);
+        if(botIdx>=0)ws.send(JSON.stringify({type:'botHit',botIdx,dmg,head,killerSlot:mySlot}));
+        skipApply=true;
+      }else if(gameMode!=="1v1"&&isCoopHost&&shooter.team===1){
+        // 협동 호스트의 봇이 게스트 플레이어 피격
+        const tSlot=Object.keys(remoteEntities).find(s=>remoteEntities[s]===best.e);
+        if(tSlot!==undefined){
+          ws.send(JSON.stringify({type:'playerHit',targetSlot:+tSlot,dmg,head}));
+          // 호스트 내 원격 플레이어 상태도 반영
+          applyDamage(best.e,dmg,head,shooter);
+          skipApply=true;
+        }
+      }
     }
+    if(!skipApply)applyDamage(best.e,dmg,head,shooter);
     addBlood(ex,ey,head?12:6);
     addBloodStain(ex,ey,rand(4,7),15);
     if(shooter===player){hitMarker=0.12;if(head)sfx.head();else sfx.hit();}
@@ -499,9 +523,14 @@ function fireHitscan(shooter,wp,ang){
   const tLife=rand(0.8,1.0);
   tracers.push({x1:ox,y1:oy,x2:ex,y2:ey,t:tLife,life:tLife});
   flashes.push({x:ox,y:oy,ang,t:0.05});
-  // 온라인: 발사 시각 효과 전송 (상대방 화면에서 트레이서/사운드)
-  if(shooter===player&&ws&&ws.readyState===1){
-    ws.send(JSON.stringify({type:'shot',wk:shooter.weaponKey,ox:Math.round(ox),oy:Math.round(oy),ex:Math.round(ex),ey:Math.round(ey)}));
+  if(ws&&ws.readyState===1){
+    if(shooter===player){
+      // 내 발사 시각 효과 (슬롯 포함)
+      ws.send(JSON.stringify({type:'shot',slot:mySlot,wk:shooter.weaponKey,ox:Math.round(ox),oy:Math.round(oy),ex:Math.round(ex),ey:Math.round(ey)}));
+    }else if(isCoopHost&&shooter.team===1){
+      // 호스트: 봇 발사 시각 효과를 게스트에게 전송
+      ws.send(JSON.stringify({type:'botShot',wk:shooter.weaponKey,ox:Math.round(ox),oy:Math.round(oy),ex:Math.round(ex),ey:Math.round(ey)}));
+    }
   }
 }
 function applyDamage(e,dmg,head,shooter){
@@ -545,6 +574,13 @@ function kill(e,head,shooter){
   if(e===player){deathT=0;setDeathAudio(true);deathKiller=shooter?{name:shooter.name,weapon:shooter.weaponKey}:null;}
   if(shooter===player&&e.team!==player.team){
     _awardKill(e,head,shooter);
+  }
+  // 협동 호스트: 게스트 플레이어가 봇을 처치한 경우 크레딧 브로드캐스트
+  if(isCoopHost&&netState==="playing"&&e.team===1&&shooter&&shooter.team===0&&shooter!==player){
+    const kSlot=Object.keys(remoteEntities).find(s=>remoteEntities[s]===shooter);
+    if(kSlot!==undefined&&ws&&ws.readyState===1){
+      ws.send(JSON.stringify({type:'coopKill',killerSlot:+kSlot,victimName:e.name,head,weapon:shooter.weaponKey}));
+    }
   }
 }
 function _awardKill(e,head,shooter){
@@ -600,11 +636,17 @@ function tryFire(e,aimAng,focus){
       if(d<hitRange+t.r&&Math.abs(angDiff(e.angle,Math.atan2(t.y-e.y,t.x-e.x)))<hitArc/2){
         addBlood(t.x,t.y,8);
         if(e===player){hitMarker=0.12;sfx.hit();}
-        if(t===remoteEntity&&ws&&ws.readyState===1){
-          ws.send(JSON.stringify({type:'hit',dmg:wp.dmg,head:false}));
-        }else{
-          applyDamage(t,wp.dmg,false,e);
+        let _skip=false;
+        if(ws&&ws.readyState===1){
+          if(gameMode==="1v1"&&e===player&&t===remoteEntity){
+            ws.send(JSON.stringify({type:'hit',dmg:wp.dmg,head:false}));_skip=true;
+          }else if(gameMode!=="1v1"&&!isCoopHost&&e===player&&t.team===1){
+            const bi=entities.filter(x=>x.team===1).indexOf(t);
+            if(bi>=0)ws.send(JSON.stringify({type:'botHit',botIdx:bi,dmg:wp.dmg,head:false,killerSlot:mySlot}));
+            _skip=true;
+          }
         }
+        if(!_skip)applyDamage(t,wp.dmg,false,e);
       }
     }
     return true;
@@ -717,7 +759,7 @@ addEventListener("mousedown",ev=>{
     if(netState==="lobby"){
       if(inBtn(W/2-200,H/2-20,185,52)){
         // 방 만들기
-        if(ws&&ws.readyState===1){ws.send(JSON.stringify({type:'create'}));}
+        if(ws&&ws.readyState===1){ws.send(JSON.stringify({type:'create',mode:lobbyGameMode}));}
       }
       if(inBtn(W/2+15,H/2-20,185,52)){
         // 방 참가
@@ -747,7 +789,9 @@ addEventListener("mousedown",ev=>{
       const by=H/2-78+i*84;
       if(ev.clientX>=bx&&ev.clientX<=bx+bw&&ev.clientY>=by&&ev.clientY<=by+bh){
         if(menuModeIdx===i&&m.ready){
-          if(m.key==="online"){gameState="lobby";connectToServer();}
+          if(m.key==="online"){lobbyGameMode="1v1";gameState="lobby";connectToServer();}
+          else if(m.key==="coop2"){lobbyGameMode="coop2";gameState="lobby";connectToServer();}
+          else if(m.key==="coop3"){lobbyGameMode="coop3";gameState="lobby";connectToServer();}
           else gameState="title";
         }else{menuModeIdx=i;}
       }
@@ -774,8 +818,11 @@ addEventListener("mousedown",ev=>{
     return;
   }
   if(gameState==="matchEnd"){
-    if(inBtn(W/2-160,H/2+150,150,46)){resetMatch();newRound();gameState="game";}
-    if(inBtn(W/2+10,H/2+150,150,46)){resetMatch();gameState="menu";scoped=false;}
+    const _t0cnt=entities.filter(e=>e.team===0).length;
+    const _t1cnt=entities.filter(e=>e.team===1).length;
+    const _bty=(H/2-74)+32+(_t0cnt+_t1cnt)*36+22*2+10+20;
+    if(inBtn(W/2-160,_bty,150,44)){resetMatch();newRound();gameState="game";}
+    if(inBtn(W/2+10,_bty,150,44)){resetMatch();gameState="menu";scoped=false;}
     return;
   }
   if(gameState==="paused"){
@@ -1075,10 +1122,10 @@ const weaponChoices=[
 ];
 let titleWeaponIdx=0;
 const gameModes=[
-  {key:"online",  label:"온라인 1 vs 1", desc:"방 코드 공유  |  인터넷 실시간  |  1순위",        ready:true},
-  {key:"versus",  label:"AI 대전",        desc:"3 vs 3 봇 전투  |  라운드제  |  혼자 플레이", ready:true},
-  {key:"coop",    label:"협동 모드",      desc:"2인 + AI 4마리  |  친구 1명  |  개발 예정",     ready:false},
-  {key:"story",   label:"스토리 모드",    desc:"싱글 캠페인  |  미션 기반  |  보류",             ready:false},
+  {key:"online",  label:"온라인 1 vs 1",   desc:"방 코드 공유  |  인터넷 실시간  |  1순위",           ready:true},
+  {key:"versus",  label:"AI 대전",          desc:"3 vs 3 봇 전투  |  라운드제  |  혼자 플레이",    ready:true},
+  {key:"coop2",   label:"협동 2인 vs AI",  desc:"2인 협동  |  봇 3마리 상대  |  방 코드 공유",     ready:true},
+  {key:"coop3",   label:"협동 3인 vs AI",  desc:"3인 협동  |  봇 4마리 상대  |  방 코드 공유",     ready:true},
 ];
 let menuModeIdx=0;
 
@@ -1114,7 +1161,9 @@ addEventListener("keydown",ev=>{
       ev.preventDefault();audioInit();
       const m=gameModes[menuModeIdx];
       if(m.ready){
-        if(m.key==="online"){gameState="lobby";connectToServer();}
+        if(m.key==="online"){lobbyGameMode="1v1";gameState="lobby";connectToServer();}
+        else if(m.key==="coop2"){lobbyGameMode="coop2";gameState="lobby";connectToServer();}
+        else if(m.key==="coop3"){lobbyGameMode="coop3";gameState="lobby";connectToServer();}
         else gameState="title";
       }
     }
@@ -1234,7 +1283,7 @@ function camEnt(){
   if(netState==="playing")return player;
   // 사망 후 연출(vignette→showcase→블랙) 중에는 사망 위치 고정
   // 7.5s 이후 블랙 화면이 완전히 깔린 상태에서 관전 대상으로 전환
-  if(player&&!player.alive&&deathT<7.5)return player;
+  if(player&&!player.alive&&deathT<5.2)return player;
   return entities.find(e=>e.team===0&&e.alive)||player;
 }
 function camX(){const c=camEnt();return c?c.x:WORLD.w/2;}
@@ -1271,16 +1320,23 @@ function loop(){
   if(netState==="playing"&&gameState==="game"){
     netSendTimer-=rawDt;
     if(netSendTimer<=0){netSendTimer=1/20;sendPlayerState();}
+    // 협동 호스트: 15Hz 봇 상태 브로드캐스트
+    if(isCoopHost){
+      coopBotTimer-=rawDt;
+      if(coopBotTimer<=0){coopBotTimer=1/15;sendBotStates();}
+    }
   }
 
   if(gameState==="game"){
     if(round.state==="pre"){
       round.t-=dt;
-      if(round.t<=0){round.state="play";round.t=CONFIG.round.buyTime;roundBannerT=1.8;}
+      if(round.t<=0){round.state="play";round.t=CONFIG.round.buyTime;roundBannerT=1.2;}
     }else if(round.state==="play"){
       if(round.t>0)round.t=Math.max(0,round.t-dt);
       updatePlayer(dt,now);
-      for(const e of entities)if(e.isBot&&e!==remoteEntity)updateBot(e,dt);
+      // 봇 AI: 오프라인 전체 실행 / 온라인 1v1은 remoteEntity 제외 / 협동 호스트만 실행
+      const _canRunBot=netState!=="playing"||(gameMode==="1v1")||(isCoopHost);
+      if(_canRunBot)for(const e of entities)if(e.isBot&&e!==remoteEntity)updateBot(e,dt);
       // 공통 타이머
       for(const e of entities){
         if(!e.alive)continue;
@@ -1293,11 +1349,11 @@ function loop(){
       }
       checkWin();
     }else if(round.state==="end"){
-      const showcasing=player&&!player.alive&&deathT<5.5;
+      const showcasing=player&&!player.alive&&deathT<4.4;
       if(!showcasing)round.t-=dt;
       if(round.t<=0){round.state="result";round.t=CONFIG.round.resultTime;}
     }else if(round.state==="result"){
-      const showcasing=player&&!player.alive&&deathT<5.5;
+      const showcasing=player&&!player.alive&&deathT<4.4;
       if(!showcasing)round.t-=dt;
       if(round.t<=0){
         if(match.state==="won")gameState="matchEnd";
@@ -1425,18 +1481,18 @@ function render(){
     }
     ctx.restore();
     // 무기 이름 레이블
-    ctx.font="bold 9px monospace";ctx.textAlign="center";
+    ctx.font="bold 15px monospace";ctx.textAlign="center";
     ctx.fillStyle=isAwp?"#88ccff":"#f0d060";
     ctx.fillText(dwp.name,d.x,d.y+26);
     // 탄약 표시
     if(!dwp.melee){
-      ctx.font="8px monospace";
+      ctx.font="15px monospace";
       ctx.fillStyle="rgba(180,200,180,0.8)";
       ctx.fillText(`${d.mag||0}/${d.reserve||0}`,d.x,d.y+35);
     }
     // 가까우면 F 줍기 힌트
     if(player&&player.alive&&(d.spawnT||0)<=0&&dist2(player.x,player.y,d.x,d.y)<34*34){
-      ctx.font="bold 11px monospace";ctx.fillStyle="#f0e070";
+      ctx.font="bold 15px monospace";ctx.fillStyle="#f0e070";
       ctx.fillText("F — 줍기",d.x,d.y-20);
     }
   }
@@ -1465,7 +1521,7 @@ function render(){
     if(age<5){
       const textA=(1-age/5)*0.85;
       ctx.fillStyle=`rgba(255,200,100,${textA})`;
-      ctx.font="bold 10px monospace";ctx.textAlign="center";
+      ctx.font="bold 15px monospace";ctx.textAlign="center";
       ctx.fillText("!",cp.x,cp.y-22);
     }
   }
@@ -1580,7 +1636,7 @@ function render(){
 
   // 디버그: 봇 상태 라벨
   if(CONFIG.debug){
-    ctx.font="11px monospace";ctx.textAlign="center";
+    ctx.font="15px monospace";ctx.textAlign="center";
     for(const b of entities){
       if(!b.isBot||!b.alive)continue;
       ctx.fillStyle="#fff";
@@ -1629,7 +1685,7 @@ function render(){
   if(roundBannerT>0&&round.state==="play"){
     const fa=roundBannerT>1.4?clamp((1.8-roundBannerT)/0.25,0,1):clamp(roundBannerT/0.35,0,1);
     ctx.save();ctx.globalAlpha=fa;ctx.textAlign="center";
-    ctx.font="bold 10px monospace";ctx.fillStyle="rgba(150,180,220,0.8)";
+    ctx.font="bold 15px monospace";ctx.fillStyle="rgba(150,180,220,0.8)";
     ctx.fillText("ROUND",W/2,H/2-44);
     ctx.font=`bold 80px monospace`;ctx.fillStyle="#e8eef5";
     ctx.fillText(`${round.n}`,W/2,H/2+28);
@@ -1741,7 +1797,7 @@ function drawEntity(e){
   ctx.fillStyle=e.team===0?"#5bd68a":"#e05252";
   ctx.fillRect(e.x-w/2,e.y-e.r-12,w*hpr,4);
   // 이름
-  ctx.font="10px sans-serif";ctx.textAlign="center";
+  ctx.font="15px sans-serif";ctx.textAlign="center";
   ctx.fillStyle="rgba(255,255,255,0.75)";
   ctx.fillText(e.name,e.x,e.y-e.r-16);
   // 장전 표시
@@ -1766,142 +1822,126 @@ function hudPanel(x,y,w,h){
 
 function drawKillerShowcase(t){
   const cx=W/2, cy=H/2;
-  const cw=520, ch=260;
-  const slideOff=Math.max(0,(0.4-t)/0.4)*70;
-  const px0=cx-cw/2, py0=cy-ch/2-20-slideOff;
+  const cw=620, ch=370;
+  const slideOff=Math.max(0,(0.4-t)/0.4)*80;
+  const px0=cx-cw/2, py0=cy-ch/2-slideOff;
   const wk=deathKiller?deathKiller.weapon:"ak";
 
-  // ── 배경 카드 ────────────────────────────────
-  ctx.fillStyle="rgba(0,0,0,0.65)";
-  rr(px0+8,py0+8,cw,ch,14);ctx.fill();
+  // ── 배경 카드 (그림자 + 본체)
+  ctx.fillStyle="rgba(0,0,0,0.7)";
+  rr(px0+10,py0+10,cw,ch,16);ctx.fill();
   ctx.fillStyle="rgba(5,7,13,0.98)";
-  rr(px0,py0,cw,ch,14);ctx.fill();
+  rr(px0,py0,cw,ch,16);ctx.fill();
 
-  // ── 이미지 (좌측 절반, 풀 높이) ──────────────
-  const imgW=220;
+  // ── 좌측 캐릭터 이미지 (270px, 풀 높이, 상단 정렬)
+  const imgW=270;
   ctx.save();
-  // 좌측 둥근 모서리 영역에 클리핑
   ctx.beginPath();
-  ctx.moveTo(px0+14,py0);ctx.lineTo(px0+imgW,py0);
-  ctx.lineTo(px0+imgW,py0+ch);ctx.lineTo(px0+14,py0+ch);
-  ctx.arcTo(px0,py0+ch,px0,py0+ch-14,14);ctx.lineTo(px0,py0+14);
-  ctx.arcTo(px0,py0,px0+14,py0,14);ctx.closePath();
+  ctx.moveTo(px0+16,py0);ctx.lineTo(px0+imgW,py0);
+  ctx.lineTo(px0+imgW,py0+ch);ctx.lineTo(px0+16,py0+ch);
+  ctx.arcTo(px0,py0+ch,px0,py0+ch-16,16);ctx.lineTo(px0,py0+16);
+  ctx.arcTo(px0,py0,px0+16,py0,16);ctx.closePath();
   ctx.clip();
 
   if(killerImg.complete&&killerImg.naturalWidth>0){
     const iR=killerImg.naturalWidth/killerImg.naturalHeight;
     const bR=imgW/ch;
     let iw,ih,ix,iy;
-    if(iR>bR){ih=ch;iw=ih*iR;ix=px0+(imgW-iw)/2;iy=py0;}
-    else{iw=imgW;ih=iw/iR;ix=px0;iy=py0+(ch-ih)/2;}
+    if(iR>bR){
+      // 가로형: 높이 맞추고 수평 중앙
+      ih=ch;iw=ih*iR;ix=px0+(imgW-iw)/2;iy=py0;
+    }else{
+      // 세로형: 너비 맞추고 상단 정렬 → 머리가 잘리지 않음
+      iw=imgW;ih=iw/iR;ix=px0;iy=py0;
+    }
     ctx.drawImage(killerImg,ix,iy,iw,ih);
   }else{
-    ctx.fillStyle="rgba(35,8,8,0.95)";ctx.fillRect(px0,py0,imgW,ch);
-    ctx.font="bold 36px monospace";ctx.fillStyle="rgba(180,40,40,0.3)";
-    ctx.textAlign="center";ctx.fillText("?",px0+imgW/2,py0+ch/2+12);
+    ctx.fillStyle="rgba(30,8,8,0.95)";ctx.fillRect(px0,py0,imgW,ch);
+    ctx.font="bold 48px monospace";ctx.fillStyle="rgba(180,40,40,0.25)";
+    ctx.textAlign="center";ctx.fillText("?",px0+imgW/2,py0+ch/2+16);
   }
 
-  // 이미지 → 카드 배경 그라데이션 페이드 (우측)
-  const rFade=ctx.createLinearGradient(px0+imgW*0.45,0,px0+imgW,0);
-  rFade.addColorStop(0,"rgba(5,7,13,0)");
-  rFade.addColorStop(1,"rgba(5,7,13,1)");
+  // 우측 그라데이션 페이드
+  const rFade=ctx.createLinearGradient(px0+imgW*0.48,0,px0+imgW,0);
+  rFade.addColorStop(0,"rgba(5,7,13,0)");rFade.addColorStop(1,"rgba(5,7,13,1)");
   ctx.fillStyle=rFade;ctx.fillRect(px0,py0,imgW,ch);
-
-  // 이미지 하단 어둡게
-  const bFade=ctx.createLinearGradient(0,py0+ch*0.6,0,py0+ch);
-  bFade.addColorStop(0,"rgba(5,7,13,0)");
-  bFade.addColorStop(1,"rgba(5,7,13,0.6)");
+  // 하단 어둡게
+  const bFade=ctx.createLinearGradient(0,py0+ch*0.68,0,py0+ch);
+  bFade.addColorStop(0,"rgba(5,7,13,0)");bFade.addColorStop(1,"rgba(5,7,13,0.55)");
   ctx.fillStyle=bFade;ctx.fillRect(px0,py0,imgW,ch);
-
   ctx.restore();
 
-  // ── 카드 테두리 ──────────────────────────────
-  ctx.strokeStyle="rgba(140,28,28,0.7)";ctx.lineWidth=1.5;
-  rr(px0,py0,cw,ch,14);ctx.stroke();
+  // ── 테두리 + 상단 강조선
+  ctx.strokeStyle="rgba(160,28,28,0.65)";ctx.lineWidth=1.5;
+  rr(px0,py0,cw,ch,16);ctx.stroke();
+  ctx.fillStyle="rgba(190,32,32,0.9)";
+  rr(px0,py0,cw,6,4);ctx.fill();
 
-  // 상단 레드 강조선
-  ctx.fillStyle="rgba(160,28,28,0.85)";
-  rr(px0,py0,cw,4,4);ctx.fill();
+  // ── 우측 정보 영역
+  const tx=px0+imgW+24, tw=cw-imgW-38;
 
-  // ── 이미지 위 텍스트 (ELIMINATED BY) ─────────
-  // 이미지 하단에 배너
-  const bannerH=36;
-  const bannerGrad=ctx.createLinearGradient(0,py0+ch-bannerH,0,py0+ch);
-  bannerGrad.addColorStop(0,"rgba(120,10,10,0)");
-  bannerGrad.addColorStop(1,"rgba(120,10,10,0.55)");
-  ctx.fillStyle=bannerGrad;ctx.fillRect(px0,py0+ch-bannerH,imgW,bannerH);
-
-  // ── 우측 정보 영역 ────────────────────────────
-  const tx=px0+imgW+20, tw=cw-imgW-32;
-
-  // "ELIMINATED BY" 레이블
+  // ELIMINATED BY + 스코어
   ctx.textAlign="left";
-  ctx.font="bold 9px monospace";
-  ctx.fillStyle="rgba(210,55,55,0.9)";
-  ctx.fillText("■  ELIMINATED BY",tx,py0+26);
+  ctx.font="bold 15px monospace";
+  ctx.fillStyle="rgba(220,55,55,0.9)";
+  ctx.fillText("■  ELIMINATED BY",tx,py0+34);
+  const ms=player?round.scores[player.team]:round.scores[0];
+  const ts=player?round.scores[1-player.team]:round.scores[1];
+  ctx.textAlign="right";ctx.font="15px monospace";
+  ctx.fillStyle="rgba(110,118,132,0.65)";
+  ctx.fillText(`${ms}  :  ${ts}`,px0+cw-16,py0+34);
 
-  // 라운드 스코어 우측
-  const [s0,s1]=round.scores;
-  const ms=player?round.scores[player.team]:s0;
-  const ts=player?round.scores[1-player.team]:s1;
-  ctx.textAlign="right";ctx.font="9px monospace";
-  ctx.fillStyle="rgba(115,120,132,0.6)";
-  ctx.fillText(`${ms}  :  ${ts}`,px0+cw-14,py0+26);
+  // 구분선
+  ctx.strokeStyle="rgba(100,16,16,0.5)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(tx,py0+44);ctx.lineTo(px0+cw-14,py0+44);ctx.stroke();
 
-  // 가로선
-  ctx.strokeStyle="rgba(90,14,14,0.55)";ctx.lineWidth=1;
-  ctx.beginPath();ctx.moveTo(tx,py0+32);ctx.lineTo(px0+cw-12,py0+32);ctx.stroke();
-
-  // 이름
+  // 이름 (큰 글씨 + 레드 글로우)
   ctx.textAlign="left";
-  ctx.font="bold 32px monospace";
+  ctx.font="bold 40px monospace";
   ctx.fillStyle="#ffffff";
   let nm=deathKiller?deathKiller.name:"?";
   while(ctx.measureText(nm).width>tw&&nm.length>1)nm=nm.slice(0,-1);
   if(nm!==(deathKiller?deathKiller.name:"?"))nm+="…";
-  // 글로우 효과
-  ctx.shadowColor="rgba(255,100,100,0.35)";ctx.shadowBlur=12;
-  ctx.fillText(nm,tx,py0+80);
+  ctx.shadowColor="rgba(255,70,70,0.45)";ctx.shadowBlur=16;
+  ctx.fillText(nm,tx,py0+106);
   ctx.shadowBlur=0;
 
   // 무기명
   const wpName=deathKiller?(CONFIG.weapons[wk]?.name||wk):"";
-  ctx.font="14px sans-serif";ctx.fillStyle="rgba(188,142,142,0.88)";
-  ctx.fillText(wpName,tx,py0+106);
+  ctx.font="bold 22px sans-serif";ctx.fillStyle="rgba(200,148,148,0.9)";
+  ctx.fillText(wpName,tx,py0+140);
 
   // 구분선
-  ctx.strokeStyle="rgba(95,16,16,0.3)";ctx.lineWidth=1;
-  ctx.beginPath();ctx.moveTo(tx,py0+118);ctx.lineTo(px0+cw-14,py0+118);ctx.stroke();
+  ctx.strokeStyle="rgba(90,14,14,0.28)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(tx,py0+158);ctx.lineTo(px0+cw-14,py0+158);ctx.stroke();
 
-  // 이번 라운드
-  ctx.font="9px monospace";ctx.fillStyle="rgba(125,116,126,0.65)";
-  ctx.fillText("THIS ROUND",tx,py0+136);
-
+  // THIS ROUND 킬
+  ctx.font="bold 15px monospace";ctx.fillStyle="rgba(128,118,130,0.7)";
+  ctx.fillText("THIS ROUND",tx,py0+184);
   const killerEnt=entities.find(e=>e.name===(deathKiller?deathKiller.name:""));
   const kk=killerEnt?killerEnt.roundKills:1;
-  ctx.font="bold 26px monospace";ctx.fillStyle="#e8eef5";
-  ctx.fillText(`${kk} KILL${kk!==1?"S":""}`,tx,py0+168);
+  ctx.font="bold 34px monospace";ctx.fillStyle="#e8eef5";
+  ctx.fillText(`${kk} KILL${kk!==1?"S":""}`,tx,py0+228);
 
   // HP 바
   if(killerEnt&&killerEnt.hp>0){
     const hpPct=killerEnt.hp/CONFIG.player.hp;
-    ctx.fillStyle="rgba(255,255,255,0.05)";
-    rr(tx,py0+178,tw,5,2);ctx.fill();
-    ctx.fillStyle=hpPct>0.5?"rgba(50,175,85,0.7)":hpPct>0.25?"rgba(200,148,30,0.7)":"rgba(188,38,38,0.7)";
-    rr(tx,py0+178,tw*hpPct,5,2);ctx.fill();
-    ctx.font="9px monospace";ctx.fillStyle="rgba(110,124,110,0.6)";
-    ctx.fillText(`HP  ${killerEnt.hp}`,tx,py0+197);
+    ctx.fillStyle="rgba(255,255,255,0.06)";
+    rr(tx,py0+244,tw,8,3);ctx.fill();
+    ctx.fillStyle=hpPct>0.5?"rgba(50,180,85,0.75)":hpPct>0.25?"rgba(200,148,30,0.75)":"rgba(195,38,38,0.75)";
+    rr(tx,py0+244,tw*hpPct,8,3);ctx.fill();
+    ctx.font="bold 15px monospace";ctx.fillStyle="rgba(120,138,120,0.65)";
+    ctx.fillText(`HP  ${Math.ceil(killerEnt.hp)}`,tx,py0+272);
   }
 
   // 하단 타이머 바
   const tp=Math.max(0,(2.9-t)/2.9);
   ctx.fillStyle="rgba(255,255,255,0.04)";
-  rr(px0+12,py0+ch-16,cw-24,4,2);ctx.fill();
-  ctx.fillStyle="rgba(140,28,28,0.65)";
-  rr(px0+12,py0+ch-16,(cw-24)*tp,4,2);ctx.fill();
-
-  ctx.font="9px monospace";ctx.textAlign="right";ctx.fillStyle="rgba(75,78,88,0.5)";
-  ctx.fillText("관전으로 이동 중...",px0+cw-14,py0+ch-4);
+  rr(px0+14,py0+ch-20,cw-28,5,2);ctx.fill();
+  ctx.fillStyle="rgba(160,28,28,0.65)";
+  rr(px0+14,py0+ch-20,(cw-28)*tp,5,2);ctx.fill();
+  ctx.font="bold 15px monospace";ctx.textAlign="right";ctx.fillStyle="rgba(80,76,90,0.55)";
+  ctx.fillText("관전으로 이동 중...",px0+cw-16,py0+ch-5);
 }
 function renderHUD(){
   const aliveT0=entities.filter(e=>e.team===0&&e.alive);
@@ -1936,11 +1976,11 @@ function renderHUD(){
   if(match.overtime){
     const myT=player?player.team:0;
     const ahead=round.scores[myT]>round.scores[1-myT];
-    ctx.font="bold 9px monospace";
+    ctx.font="bold 15px monospace";
     ctx.fillStyle=ahead?"#f0c040":"#888888";
     ctx.fillText(ahead?"● 매치 포인트":"— 연장전",W/2,topY+46);
   }else{
-    ctx.font="9px monospace";ctx.fillStyle="rgba(255,255,255,0.35)";
+    ctx.font="15px monospace";ctx.fillStyle="rgba(255,255,255,0.35)";
     ctx.fillText(`R ${round.n}`,W/2,topY+47);
   }
 
@@ -1961,7 +2001,7 @@ function renderHUD(){
     ctx.fillStyle=blink?"rgba(240,192,64,0.3)":(cUrgent?"#ff8060":"#f0c040");
     const inZone=player&&inBuyZone(player);
     ctx.fillText(inZone?"[ B ]  구매":"[ B ]  구매  (구역 밖)",bx+14,by+20);
-    ctx.textAlign="right";ctx.font=`bold ${cUrgent?18:14}px monospace`;
+    ctx.textAlign="right";ctx.font=`bold ${cUrgent?22:18}px monospace`;
     ctx.fillStyle=cUrgent?`rgba(255,90,50,${0.8+Math.sin(performance.now()/140)*0.2})`:"rgba(200,220,240,0.85)";
     ctx.fillText(round.state==="pre"?`출발 ${sec}초`:`구매 ${sec}초`,bx+bw-12,by+21);
   }
@@ -1970,52 +2010,49 @@ function renderHUD(){
   // 좌하단: HP
   // ══════════════════════════════════════════
   if(player){
-    const hpPx=180,hpH=12;
-    const px=20,py=H-88;
-    hudPanel(px,py,224,78);
+    const hpPx=200,hpH=10;
+    const px=20,py=H-118;
+    hudPanel(px,py,266,108);
 
     const hpR=clamp(player.hp/CONFIG.player.hp,0,1);
     const hpColor=player.hp>50?"#4cd47a":(player.hp>25?"#f0c040":"#e84040");
-    ctx.fillStyle="#9fb3c8";ctx.font="11px monospace";ctx.textAlign="left";
-    ctx.fillText("HP",px+12,py+18);
-    ctx.fillStyle=`rgba(255,255,255,${player.hp<=25?0.9:0.2})`;
-    ctx.font=`bold ${player.hp<=25?16:13}px monospace`;
-    ctx.textAlign="right";
-    ctx.fillStyle=hpColor;
-    ctx.fillText(Math.ceil(player.hp),px+212,py+20);
+    // HP 레이블 + 수치
+    ctx.fillStyle="#9fb3c8";ctx.font="bold 15px monospace";ctx.textAlign="left";
+    ctx.fillText("HP",px+12,py+24);
+    ctx.textAlign="right";ctx.fillStyle=hpColor;
+    ctx.font="bold 22px monospace";
+    ctx.fillText(Math.ceil(player.hp),px+254,py+24);
 
-    // HP 바 배경
+    // HP 바
     ctx.fillStyle="rgba(255,255,255,0.08)";
-    ctx.fillRect(px+12,py+28,hpPx,hpH);
-    // HP 바 채우기
+    ctx.fillRect(px+12,py+32,hpPx,hpH);
     ctx.fillStyle=hpColor;
-    ctx.fillRect(px+12,py+28,hpPx*hpR,hpH);
-    // HP 낮을 때 경고선
+    ctx.fillRect(px+12,py+32,hpPx*hpR,hpH);
     if(player.hp<=25){
       ctx.strokeStyle=`rgba(232,64,64,${0.4+Math.sin(performance.now()/200)*0.3})`;
-      ctx.lineWidth=1.5;
-      ctx.strokeRect(px+12,py+28,hpPx,hpH);
+      ctx.lineWidth=1.5;ctx.strokeRect(px+12,py+32,hpPx,hpH);
     }
 
-    // 구르기 쿨다운
+    // ROLL 바
     ctx.fillStyle="rgba(255,255,255,0.08)";
-    ctx.fillRect(px+12,py+48,hpPx,5);
+    ctx.fillRect(px+12,py+54,hpPx,hpH);
     const rollFill=roll.cd<=0?1:1-roll.cd/CONFIG.roll.cooldown;
     const chainGlow=roll.chainWin>0;
     ctx.fillStyle=chainGlow?"#44ffaa":(roll.cd<=0?"#5ba0ff":"#3a4e6a");
-    ctx.fillRect(px+12,py+48,hpPx*rollFill,5);
+    ctx.fillRect(px+12,py+54,hpPx*rollFill,hpH);
     if(chainGlow){
       ctx.strokeStyle=`rgba(68,255,170,${roll.chainWin/CONFIG.roll.chainWin*0.6})`;
-      ctx.lineWidth=1.5;ctx.strokeRect(px+12,py+48,hpPx,5);
+      ctx.lineWidth=1.5;ctx.strokeRect(px+12,py+54,hpPx,hpH);
     }
-    ctx.fillStyle="rgba(159,179,200,0.5)";ctx.font="9px monospace";ctx.textAlign="left";
-    ctx.fillText("ROLL",px+12,py+60);
+    ctx.fillStyle="rgba(159,179,200,0.5)";ctx.font="bold 15px monospace";ctx.textAlign="left";
+    ctx.fillText("ROLL",px+12,py+78);
     ctx.textAlign="right";
-    ctx.fillText(roll.cd<=0?"READY":`${roll.cd.toFixed(1)}s`,px+195,py+60);
-    // 자금 표시
-    ctx.textAlign="left";ctx.font="bold 11px monospace";
-    ctx.fillStyle="rgba(180,200,160,0.8)";
-    ctx.fillText(`$ ${player.money}`,px+12,py+76);
+    ctx.fillText(roll.cd<=0?"READY":`${roll.cd.toFixed(1)}s`,px+254,py+78);
+
+    // 자금
+    ctx.textAlign="left";ctx.font="bold 20px monospace";
+    ctx.fillStyle="rgba(180,200,160,0.85)";
+    ctx.fillText(`$ ${player.money}`,px+12,py+102);
   }
 
   // ══════════════════════════════════════════
@@ -2023,7 +2060,7 @@ function renderHUD(){
   // ══════════════════════════════════════════
   if(player){
     const wp=weaponOf(player);
-    const ww=200,wh=84,wx=W-ww-20,wy=H-wh-20;
+    const ww=240,wh=100,wx=W-ww-20,wy=H-wh-20;
     hudPanel(wx,wy,ww,wh);
     if(buyFlash>0){
       ctx.strokeStyle=`rgba(80,220,100,${buyFlash*0.9})`;ctx.lineWidth=2.5;
@@ -2032,51 +2069,44 @@ function renderHUD(){
 
     // 무기 이름
     ctx.textAlign="left";
-    ctx.font="bold 14px monospace";
+    ctx.font="bold 20px monospace";
     ctx.fillStyle=buyFlash>0?`rgba(180,255,160,${0.6+buyFlash*0.4})`:"#9fb3c8";
-    ctx.fillText(wp.name,wx+14,wy+22);
-    // AWP 조준경 상태 표시
+    ctx.fillText(wp.name,wx+14,wy+26);
+    // AWP 조준경 상태
     if(player.weaponKey==="awp"){
-      ctx.textAlign="right";
-      ctx.font="bold 9px monospace";
-      ctx.fillStyle=scoped?"rgba(100,200,255,0.95)":"rgba(100,120,150,0.5)";
-      ctx.fillText(scoped?"● SCOPE ON":"○ SCOPE OFF",wx+ww-14,wy+22);
+      ctx.textAlign="right";ctx.font="bold 15px monospace";
+      ctx.fillStyle=scoped?"rgba(100,200,255,0.95)":"rgba(100,120,150,0.45)";
+      ctx.fillText(scoped?"● SCOPE":"○ SCOPE",wx+ww-14,wy+26);
     }
 
-    // 탄약 수치
+    // 탄약
     if(!wp.melee){
       const am=player.ammo[player.weaponKey];
       const lowAmmo=am.mag<=Math.floor(wp.mag*0.3);
-      // 현재 탄창 (큰 숫자)
-      ctx.font=`bold 36px monospace`;
+      ctx.font="bold 40px monospace";
       ctx.fillStyle=lowAmmo?"#f06060":"#e8eef5";
       ctx.textAlign="right";
-      ctx.fillText(am.mag,wx+ww-60,wy+62);
-      // 구분선
+      ctx.fillText(am.mag,wx+ww-62,wy+74);
       ctx.fillStyle="rgba(255,255,255,0.25)";
-      ctx.font="bold 28px monospace";
-      ctx.fillText("/",wx+ww-50,wy+60);
-      // 예비 탄약
-      ctx.font="bold 20px monospace";
+      ctx.font="bold 30px monospace";
+      ctx.fillText("/",wx+ww-52,wy+72);
+      ctx.font="bold 22px monospace";
       ctx.fillStyle="rgba(180,195,210,0.7)";
-      ctx.fillText(am.reserve,wx+ww-14,wy+62);
+      ctx.fillText(am.reserve,wx+ww-14,wy+74);
 
-      // 장전 진행 바
       if(player.reloading>0){
         const rProg=1-player.reloading/wp.reloadTime;
         ctx.fillStyle="rgba(255,255,255,0.1)";
-        ctx.fillRect(wx+14,wy+70,ww-28,5);
+        ctx.fillRect(wx+14,wy+82,ww-28,6);
         ctx.fillStyle="#f0c040";
-        ctx.fillRect(wx+14,wy+70,(ww-28)*rProg,5);
-        ctx.font="9px monospace";ctx.textAlign="left";
-        ctx.fillStyle="#f0c040";
-        ctx.fillText("RELOADING",wx+14,wy+82);
+        ctx.fillRect(wx+14,wy+82,(ww-28)*rProg,6);
+        ctx.font="bold 15px monospace";ctx.textAlign="left";ctx.fillStyle="#f0c040";
+        ctx.fillText("RELOADING",wx+14,wy+97);
       }
     }else{
-      ctx.font="bold 20px monospace";
-      ctx.fillStyle="#e8eef5";
-      ctx.textAlign="center";
-      ctx.fillText("근접 무기",wx+ww/2,wy+58);
+      ctx.font="bold 22px monospace";
+      ctx.fillStyle="#e8eef5";ctx.textAlign="center";
+      ctx.fillText("근접 무기",wx+ww/2,wy+66);
     }
   }
 
@@ -2087,15 +2117,15 @@ function renderHUD(){
   feed.forEach((f,i)=>{
     const a=clamp(f.t,0,1);
     // 배경
-    const tw=ctx.measureText(f.text).width+20;
-    ctx.fillStyle=`rgba(0,0,0,${a*0.5})`;
-    ctx.fillRect(W-tw-10,14+i*22,tw,18);
-    // 텍스트 색: 헤드샷은 노란색
     const isHead=f.text.includes("[헤드샷]");
     const isKill=f.text.includes("☠");
-    ctx.font=`${isKill?"bold ":""}13px sans-serif`;
+    ctx.font=`${isKill?"bold ":""} 15px sans-serif`;
+    const tw=ctx.measureText(f.text).width+20;
+    ctx.fillStyle=`rgba(0,0,0,${a*0.5})`;
+    ctx.fillRect(W-tw-10,12+i*26,tw,22);
+    // 텍스트 색: 헤드샷은 노란색
     ctx.fillStyle=isHead?`rgba(255,220,80,${a})`:`rgba(210,225,240,${a})`;
-    ctx.fillText(f.text,W-14,28+i*22);
+    ctx.fillText(f.text,W-14,28+i*26);
   });
 
   // ══════════════════════════════════════════
@@ -2138,26 +2168,26 @@ function renderHUD(){
       // 완전 암전
       const fa=clamp((deathT-1.5)/0.5,0,1);
       ctx.fillStyle=`rgba(0,0,0,${fa})`;ctx.fillRect(0,0,W,H);
-    }else if(deathT<5.2){
-      // 킬러 쇼케이스
+    }else if(deathT<4.4){
+      // 킬러 쇼케이스 (2.3~4.4초, 2.1초간)
       ctx.fillStyle="#050608";ctx.fillRect(0,0,W,H);
       const t=deathT-2.3;
-      const fadeIn=clamp(t/0.35,0,1);
-      const fadeOut=deathT>4.7?clamp((5.2-deathT)/0.5,0,1):1;
+      const fadeIn=clamp(t/0.3,0,1);
+      const fadeOut=deathT>3.9?clamp((4.4-deathT)/0.5,0,1):1;
       ctx.save();ctx.globalAlpha=fadeIn*fadeOut;
       drawKillerShowcase(t);
       ctx.restore();
     }else{
-      // 관전 전환 딜레이: 2.5초 블랙 → 0.7초 페이드인
-      const elapsed=deathT-5.2;
-      const alpha=elapsed<2.5?0.97:clamp(1.0-(elapsed-2.5)/0.7,0,0.97);
+      // 관전 전환 딜레이: 0.8초 블랙 → 0.5초 페이드인
+      const elapsed=deathT-4.4;
+      const alpha=elapsed<0.8?0.97:clamp(1.0-(elapsed-0.8)/0.5,0,0.97);
       if(alpha>0){ctx.fillStyle=`rgba(0,0,0,${alpha})`;ctx.fillRect(0,0,W,H);}
     }
     // 관전 중 표시: 딜레이 끝나고 페이드인
-    if(deathT>7.8){
-      const ia=clamp((deathT-7.8)/0.4,0,0.85);
+    if(deathT>5.4){
+      const ia=clamp((deathT-5.4)/0.4,0,0.85);
       ctx.save();ctx.globalAlpha=ia;
-      ctx.font="bold 13px monospace";ctx.fillStyle="#ff8080";ctx.textAlign="left";
+      ctx.font="bold 15px monospace";ctx.fillStyle="#ff8080";ctx.textAlign="left";
       ctx.fillText("▶ 관전 중",24,H-24);
       ctx.restore();
     }
@@ -2187,7 +2217,7 @@ function renderHUD(){
   // ══════════════════════════════════════════
   // 라운드 배너
   // ══════════════════════════════════════════
-  const _showcasing=player&&!player.alive&&deathT>=2.3&&deathT<5.2;
+  const _showcasing=player&&!player.alive&&deathT>=2.3&&deathT<4.4;
   if(round.state==="pre"){
     ctx.fillStyle="rgba(0,0,0,0.6)";ctx.fillRect(0,H/2-55,W,110);
     ctx.strokeStyle="rgba(255,255,255,0.06)";ctx.lineWidth=1;
@@ -2196,7 +2226,7 @@ function renderHUD(){
     ctx.fillStyle="#dde4ec";
     ctx.fillText(`ROUND  ${round.n}`,W/2,H/2+10);
     if(player){
-      ctx.font="12px monospace";ctx.fillStyle="rgba(180,200,160,0.7)";
+      ctx.font="15px monospace";ctx.fillStyle="rgba(180,200,160,0.7)";
       ctx.fillText(`$ ${player.money}   |   B — 무기 구매`,W/2,H/2+38);
     }
   }else if(round.state==="end"&&!_showcasing){
@@ -2205,7 +2235,7 @@ function renderHUD(){
     ctx.font="bold 42px sans-serif";ctx.textAlign="center";
     ctx.fillStyle=win?"#4cd47a":"#e84040";
     ctx.fillText(round.msg,W/2,H/2+6);
-    ctx.font="16px monospace";ctx.fillStyle="rgba(180,195,210,0.8)";
+    ctx.font="15px monospace";ctx.fillStyle="rgba(180,195,210,0.8)";
     {const _ms=player?round.scores[player.team]:round.scores[0];const _ts=player?round.scores[1-player.team]:round.scores[1];ctx.fillText(`${_ms}  —  ${_ts}`,W/2,H/2+36);}
   }else if(round.state==="result"&&!_showcasing){
     renderResult();
@@ -2214,7 +2244,7 @@ function renderHUD(){
   // ══════════════════════════════════════════
   // 조작 힌트 (좌하단 하단, 작게)
   // ══════════════════════════════════════════
-  ctx.textAlign="left";ctx.font="10px monospace";ctx.fillStyle="rgba(120,140,160,0.4)";
+  ctx.textAlign="left";ctx.font="15px monospace";ctx.fillStyle="rgba(120,140,160,0.4)";
   ctx.fillText("WASD 이동  ·  Shift 걷기  ·  Space 구르기  ·  R 재장전  ·  Tab 스코어보드  ·  우클릭: 집중사격 / AWP: 조준경 토글",24,H-8);
   if(showScoreboard)renderScoreboard();
 }
@@ -2234,9 +2264,9 @@ function renderBuyMenu(){
   rr(px,py,pw,ph,14);ctx.fill();ctx.stroke();
   ctx.fillStyle="#1a4a6a";rr(px+1,py+1,pw-2,5,3);ctx.fill();
   ctx.textAlign="center";
-  ctx.font="bold 18px monospace";ctx.fillStyle="#68b8ec";
+  ctx.font="bold 15px monospace";ctx.fillStyle="#68b8ec";
   ctx.fillText("무기 구매",W/2,py+34);
-  ctx.font="11px monospace";ctx.fillStyle="rgba(180,200,160,0.9)";
+  ctx.font="15px monospace";ctx.fillStyle="rgba(180,200,160,0.9)";
   ctx.fillText(`보유 자금  $ ${player.money}`,W/2,py+56);
   ctx.strokeStyle="rgba(30,60,100,0.4)";ctx.lineWidth=1;
   ctx.beginPath();ctx.moveTo(px+24,py+68);ctx.lineTo(px+pw-24,py+68);ctx.stroke();
@@ -2255,16 +2285,16 @@ function renderBuyMenu(){
     rr(ix,iy,iw,ih,8);ctx.fill();ctx.stroke();
     if(isEquipped){
       ctx.fillStyle=`${item.col}22`;rr(ix+1,iy+1,iw-2,ih-2,7);ctx.fill();
-      ctx.font="bold 8px monospace";ctx.fillStyle=item.col;ctx.textAlign="right";
-      ctx.fillText("장착중",ix+iw-8,iy+14);
+      ctx.font="bold 15px monospace";ctx.fillStyle=item.col;ctx.textAlign="right";
+      ctx.fillText("장착중",ix+iw-8,iy+22);
     }
     ctx.textAlign="center";
     ctx.font=`bold 15px monospace`;ctx.fillStyle=canAfford?item.col:`${item.col}55`;
     ctx.fillText(item.name,ix+iw/2,iy+30);
-    ctx.font="9px sans-serif";ctx.fillStyle=canAfford?"rgba(170,190,210,0.8)":"rgba(100,110,120,0.5)";
+    ctx.font="15px sans-serif";ctx.fillStyle=canAfford?"rgba(170,190,210,0.8)":"rgba(100,110,120,0.5)";
     const lines=item.desc.split("|");
-    lines.forEach((l,li)=>ctx.fillText(l.trim(),ix+iw/2,iy+46+li*14));
-    ctx.font="bold 13px monospace";
+    lines.forEach((l,li)=>ctx.fillText(l.trim(),ix+iw/2,iy+50+li*22));
+    ctx.font="bold 15px monospace";
     ctx.fillStyle=canAfford?"#c8e870":"#885555";
     ctx.fillText(`$${item.price}`,ix+iw/2,iy+ih-10);
   });
@@ -2272,28 +2302,28 @@ function renderBuyMenu(){
   // 기본 장비 (칼, 권총) — 하단 가로 배치
   ctx.strokeStyle="rgba(30,60,100,0.25)";ctx.lineWidth=1;
   ctx.beginPath();ctx.moveTo(px+24,py+200);ctx.lineTo(px+pw-24,py+200);ctx.stroke();
-  ctx.font="bold 9px monospace";ctx.fillStyle="rgba(80,100,120,0.6)";ctx.textAlign="left";
+  ctx.font="bold 15px monospace";ctx.fillStyle="rgba(80,100,120,0.6)";ctx.textAlign="left";
   ctx.fillText("기본 장비 — 항상 소지",px+24,py+214);
   const freeItems=BUY_ITEMS.filter(it=>it.price===0);
-  const fiw=230, fih=60;
+  const fiw=230, fih=70;
   freeItems.forEach((item,i)=>{
-    const fix=px+20+i*(fiw+16), fiy=py+220;
+    const fix=px+20+i*(fiw+16), fiy=py+222;
     const isEquipped=player.weaponKey===item.key;
     ctx.fillStyle=isEquipped?"rgba(20,40,30,0.7)":"rgba(8,16,26,0.7)";
     ctx.strokeStyle=`${item.col}44`;ctx.lineWidth=1;
     rr(fix,fiy,fiw,fih,6);ctx.fill();ctx.stroke();
     ctx.textAlign="left";
-    ctx.font=`bold 13px monospace`;ctx.fillStyle=item.col;
-    ctx.fillText(item.name,fix+14,fiy+22);
-    ctx.font="9px sans-serif";ctx.fillStyle="rgba(140,160,180,0.6)";
-    ctx.fillText(item.desc.split("|")[0].trim(),fix+14,fiy+38);
-    ctx.font="bold 9px monospace";ctx.fillStyle="rgba(100,160,100,0.7)";
+    ctx.font=`bold 15px monospace`;ctx.fillStyle=item.col;
+    ctx.fillText(item.name,fix+14,fiy+24);
+    ctx.font="15px sans-serif";ctx.fillStyle="rgba(140,160,180,0.6)";
+    ctx.fillText(item.desc.split("|")[0].trim(),fix+14,fiy+46);
+    ctx.font="bold 15px monospace";ctx.fillStyle="rgba(100,160,100,0.7)";
     ctx.textAlign="right";
-    ctx.fillText("항상 소지",fix+fiw-10,fiy+22);
-    if(isEquipped){ctx.fillStyle=`${item.col}99`;ctx.fillText("▶ 장착중",fix+fiw-10,fiy+38);}
+    ctx.fillText("항상 소지",fix+fiw-10,fiy+24);
+    if(isEquipped){ctx.fillStyle=`${item.col}99`;ctx.fillText("▶ 장착중",fix+fiw-10,fiy+46);}
   });
 
-  ctx.font="11px sans-serif";ctx.fillStyle="rgba(80,100,120,0.7)";ctx.textAlign="center";
+  ctx.font="15px sans-serif";ctx.fillStyle="rgba(80,100,120,0.7)";ctx.textAlign="center";
   ctx.fillText("B 또는 ESC로 닫기",W/2,py+ph-12);
   ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,4,0,TAU);ctx.fill();
   ctx.fillStyle="#0af";ctx.beginPath();ctx.arc(mouse.x,mouse.y,2,0,TAU);ctx.fill();
@@ -2324,68 +2354,122 @@ function renderMatchEnd(){
   const myTeam=player?player.team:0;
   const iWin=match.winner===myTeam;
   const [ms,ts]=player?[round.scores[player.team],round.scores[1-player.team]]:[round.scores[0],round.scores[1]];
+
   // 배경 그라디언트
   const g=ctx.createRadialGradient(W/2,H/2,0,W/2,H/2,Math.max(W,H)*0.6);
   g.addColorStop(0,iWin?"rgba(10,40,15,0.9)":"rgba(40,10,10,0.9)");
   g.addColorStop(1,"rgba(0,0,0,0)");
   ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
-  // 승패 텍스트
+
+  // VICTORY/DEFEAT 워터마크
   ctx.textAlign="center";
   ctx.font="bold 88px monospace";
-  ctx.fillStyle=iWin?"rgba(240,192,64,0.12)":"rgba(200,64,64,0.12)";
-  ctx.fillText(iWin?"VICTORY":"DEFEAT",W/2,H/2+30);
-  ctx.font="bold 72px monospace";
+  ctx.fillStyle=iWin?"rgba(240,192,64,0.07)":"rgba(200,64,64,0.07)";
+  ctx.fillText(iWin?"VICTORY":"DEFEAT",W/2,H/2+20);
+
+  // 승패 타이틀 + 스코어
+  ctx.font="bold 62px monospace";
   ctx.fillStyle=iWin?"#f0c040":"#c84040";
-  ctx.fillText(iWin?"매치 승리":"매치 패배",W/2,H/2-40);
-  // 최종 스코어
-  ctx.font="bold 40px monospace";ctx.fillStyle="#e8eef5";
-  ctx.fillText(`${ms}  :  ${ts}`,W/2,H/2+30);
-  ctx.font="13px sans-serif";ctx.fillStyle="rgba(140,160,180,0.7)";
-  ctx.fillText("최종 스코어",W/2,H/2+56);
+  ctx.fillText(iWin?"매치 승리":"매치 패배",W/2,H/2-152);
+  ctx.font="bold 36px monospace";ctx.fillStyle="#e8eef5";
+  ctx.fillText(`${ms}  :  ${ts}`,W/2,H/2-110);
+  ctx.font="15px sans-serif";ctx.fillStyle="rgba(140,160,180,0.55)";
+  ctx.fillText("최종 스코어",W/2,H/2-90);
 
-  // ── 내 매치 활약 ──────────────────────────────
-  const pn=player?player.name:"YOU";
-  const pm=_mst(pn);
-  const pHeads=player?player.roundHeads:0;
-  // 구분선
-  ctx.strokeStyle="rgba(80,90,110,0.3)";ctx.lineWidth=1;
-  ctx.beginPath();ctx.moveTo(W/2-180,H/2+68);ctx.lineTo(W/2+180,H/2+68);ctx.stroke();
-  // 레이블
-  ctx.font="bold 9px monospace";ctx.fillStyle="rgba(110,120,135,0.6)";
-  ctx.fillText("내 매치 기록",W/2,H/2+80);
-  // 3개 스탯 칸
-  const statDefs=[
-    {label:"KILLS",  val:pm.k,    col:iWin?"#c8e870":"#ff9060"},
-    {label:"DEATHS", val:pm.d,    col:"rgba(200,160,160,0.85)"},
-    {label:"K / D",  val:pm.d>0?(pm.k/pm.d).toFixed(2):pm.k>0?"∞":"—", col:"rgba(130,200,160,0.9)"},
-  ];
-  statDefs.forEach((s,i)=>{
-    const bx=W/2-180+i*122;
-    // 배경 박스
-    ctx.fillStyle=`rgba(255,255,255,0.03)`;
-    rr(bx,H/2+84,114,52,6);ctx.fill();
-    ctx.strokeStyle=`rgba(100,110,130,0.15)`;ctx.lineWidth=1;
-    rr(bx,H/2+84,114,52,6);ctx.stroke();
-    // 숫자
-    ctx.font="bold 28px monospace";ctx.fillStyle=s.col;
-    ctx.fillText(s.val,bx+57,H/2+118);
-    // 레이블
-    ctx.font="8px monospace";ctx.fillStyle="rgba(100,108,122,0.65)";
-    ctx.fillText(s.label,bx+57,H/2+130);
-  });
+  // ── 전체 플레이어 결과 테이블 ──────────────────────
+  const sw=520, sx=W/2-sw/2;
+  const tpy=H/2-74;
 
-  // 버튼
-  const hov1=inBtn(W/2-160,H/2+150,150,46),hov2=inBtn(W/2+10,H/2+150,150,46);
+  // 테이블 배경 패널
+  const t0=entities.filter(e=>e.team===0).sort((a,b)=>(_mst(b.name).k||0)-(_mst(a.name).k||0));
+  const t1=entities.filter(e=>e.team===1).sort((a,b)=>(_mst(b.name).k||0)-(_mst(a.name).k||0));
+  const rowH=36;
+  const panH=36+(t0.length+t1.length)*rowH+22*2+10+16;
+  ctx.fillStyle="rgba(255,255,255,0.03)";
+  rr(sx,tpy-6,sw,panH,8);ctx.fill();
+  ctx.strokeStyle="rgba(50,70,110,0.3)";ctx.lineWidth=1;
+  rr(sx,tpy-6,sw,panH,8);ctx.stroke();
+
+  // 상단 구분선 + "최종 결과" 레이블
+  ctx.strokeStyle="rgba(80,90,110,0.4)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(sx+16,tpy+8);ctx.lineTo(sx+sw-16,tpy+8);ctx.stroke();
+  ctx.font="bold 15px monospace";ctx.fillStyle="rgba(110,120,135,0.65)";
+  ctx.fillText("최  종  결  과",W/2,tpy+2);
+
+  // 컬럼 위치
+  const nX=sx+16, kX=sx+sw-160, dX=sx+sw-98, kdX=sx+sw-14;
+
+  let ry=tpy+18;
+  // 컬럼 헤더
+  ctx.font="bold 15px monospace";ctx.fillStyle="rgba(100,112,132,0.55)";
+  ctx.textAlign="left"; ctx.fillText("NAME",nX,ry);
+  ctx.textAlign="right";
+  ctx.fillText("K",kX,ry);ctx.fillText("D",dX,ry);ctx.fillText("K/D",kdX,ry);
+  ry+=8;
+  ctx.strokeStyle="rgba(50,65,90,0.3)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(sx+10,ry);ctx.lineTo(sx+sw-10,ry);ctx.stroke();
+  ry+=6;
+
+  const drawTeamRows=(ents,teamCol)=>{
+    ents.forEach(e=>{
+      const isMe=e===player;
+      const em=_mst(e.name);
+      const kd=em.d>0?(em.k/em.d).toFixed(2):em.k>0?"∞":"—";
+      if(isMe){
+        ctx.fillStyle="rgba(28,56,110,0.28)";
+        rr(sx+6,ry,sw-12,rowH-2,4);ctx.fill();
+      }
+      ctx.textAlign="left";
+      ctx.font=`${isMe?"bold ":""}15px ${isMe?"monospace":"sans-serif"}`;
+      ctx.fillStyle=isMe?"#88c8ff":teamCol;
+      ctx.fillText((isMe?"▶ ":"")+e.name,nX,ry+22);
+      ctx.textAlign="right";
+      ctx.font="bold 15px monospace";ctx.fillStyle="#dde4ec";
+      ctx.fillText(em.k,kX,ry+22);
+      ctx.fillStyle="rgba(195,172,172,0.85)";
+      ctx.fillText(em.d,dX,ry+22);
+      ctx.fillStyle="rgba(152,196,152,0.85)";
+      ctx.fillText(kd,kdX,ry+22);
+      ry+=rowH;
+    });
+  };
+
+  // Team 0
+  ctx.textAlign="left";ctx.font="bold 15px monospace";
+  ctx.fillStyle=myTeam===0?"#6ab0e0":"rgba(100,150,190,0.55)";
+  ctx.fillText("TEAM A"+(myTeam===0?" (아군)":""),nX,ry+16);
+  ctx.textAlign="right";ctx.font="15px monospace";ctx.fillStyle="rgba(120,135,155,0.5)";
+  ctx.fillText(`${round.scores[0]} wins`,kdX,ry+16);
+  ry+=22;
+  drawTeamRows(t0,"#90b8d8");
+
+  // 팀 구분선
+  ctx.strokeStyle="rgba(50,65,90,0.22)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(sx+10,ry+2);ctx.lineTo(sx+sw-10,ry+2);ctx.stroke();
+  ry+=10;
+
+  // Team 1
+  ctx.textAlign="left";ctx.font="bold 15px monospace";
+  ctx.fillStyle=myTeam===1?"#e07070":"rgba(190,100,100,0.55)";
+  ctx.fillText("TEAM B"+(myTeam===1?" (아군)":""),nX,ry+16);
+  ctx.textAlign="right";ctx.font="15px monospace";ctx.fillStyle="rgba(120,135,155,0.5)";
+  ctx.fillText(`${round.scores[1]} wins`,kdX,ry+16);
+  ry+=22;
+  drawTeamRows(t1,"#d89090");
+
+  // 버튼 (테이블 아래 고정 간격)
+  const bty=ry+20;
+  const hov1=inBtn(W/2-160,bty,150,44),hov2=inBtn(W/2+10,bty,150,44);
   ctx.fillStyle=hov1?"rgba(30,70,130,0.95)":"rgba(16,40,80,0.9)";
   ctx.strokeStyle=hov1?"#4a8aca":"#2a4a7a";ctx.lineWidth=1.5;
-  rr(W/2-160,H/2+150,150,46,8);ctx.fill();ctx.stroke();
-  ctx.font="bold 14px monospace";ctx.fillStyle=hov1?"#aadeff":"#6ab4e8";
-  ctx.fillText("다시 하기",W/2-85,H/2+179);
+  rr(W/2-160,bty,150,44,8);ctx.fill();ctx.stroke();
+  ctx.font="bold 15px monospace";ctx.fillStyle=hov1?"#aadeff":"#6ab4e8";ctx.textAlign="center";
+  ctx.fillText("다시 하기",W/2-85,bty+28);
   ctx.fillStyle=hov2?"rgba(45,45,55,0.95)":"rgba(22,22,30,0.9)";
   ctx.strokeStyle=hov2?"#606070":"#363642";ctx.lineWidth=1.5;
-  rr(W/2+10,H/2+150,150,46,8);ctx.fill();ctx.stroke();
-  ctx.font="bold 14px monospace";ctx.fillStyle=hov2?"#c0c0d8":"#7a7a9a";
-  ctx.fillText("메인 메뉴",W/2+85,H/2+179);
+  rr(W/2+10,bty,150,44,8);ctx.fill();ctx.stroke();
+  ctx.font="bold 15px monospace";ctx.fillStyle=hov2?"#c0c0d8":"#7a7a9a";
+  ctx.fillText("메인 메뉴",W/2+85,bty+28);
   ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,4,0,TAU);ctx.fill();
   ctx.fillStyle="#0af";ctx.beginPath();ctx.arc(mouse.x,mouse.y,2,0,TAU);ctx.fill();
 }
@@ -2398,21 +2482,21 @@ function renderResult(){
   rr(px,py,pw,ph,14);ctx.fill();ctx.stroke();
   ctx.fillStyle=r.win?"#2a8a4a":"#8a2a2a";rr(px+1,py+1,pw-2,5,3);ctx.fill();
   ctx.textAlign="center";
-  ctx.font="bold 13px monospace";ctx.fillStyle="rgba(200,220,240,0.4)";
+  ctx.font="bold 15px monospace";ctx.fillStyle="rgba(200,220,240,0.4)";
   ctx.fillText("RESULT",W/2,py+22);
   ctx.font="bold 36px monospace";ctx.fillStyle=r.win?"#4cd47a":"#e84040";
   ctx.fillText(r.win?"라운드 승리":"라운드 패배",W/2,py+62);
   const ms=r.scores[r.myTeam],ts=r.scores[1-r.myTeam];
-  ctx.font="14px monospace";ctx.fillStyle="rgba(180,195,215,0.7)";
+  ctx.font="15px monospace";ctx.fillStyle="rgba(180,195,215,0.7)";
   ctx.fillText(`${ms}  :  ${ts}`,W/2,py+84);
   // 구분선
   ctx.strokeStyle="rgba(255,255,255,0.07)";ctx.lineWidth=1;
   ctx.beginPath();ctx.moveTo(px+24,py+96);ctx.lineTo(px+pw-24,py+96);ctx.stroke();
   // Stats 그리드
   const col=(bx,by,label,val,color)=>{
-    ctx.font="10px monospace";ctx.fillStyle="rgba(140,160,180,0.6)";ctx.textAlign="left";
+    ctx.font="15px monospace";ctx.fillStyle="rgba(140,160,180,0.6)";ctx.textAlign="left";
     ctx.fillText(label,bx,by);
-    ctx.font="bold 16px monospace";ctx.fillStyle=color||"#d0dce8";
+    ctx.font="bold 15px monospace";ctx.fillStyle=color||"#d0dce8";
     ctx.fillText(val,bx,by+20);
   };
   const lx=px+30,ry=py+114;
@@ -2430,7 +2514,7 @@ function renderResult(){
   const prog=1-round.t/CONFIG.round.resultTime;
   ctx.fillStyle="rgba(255,255,255,0.06)";ctx.fillRect(px+24,py+ph-22,pw-48,4);
   ctx.fillStyle=r.win?"#2a7a3a":"#7a2a2a";ctx.fillRect(px+24,py+ph-22,(pw-48)*prog,4);
-  ctx.font="10px sans-serif";ctx.fillStyle="rgba(120,140,160,0.5)";ctx.textAlign="center";
+  ctx.font="15px sans-serif";ctx.fillStyle="rgba(120,140,160,0.5)";ctx.textAlign="center";
   ctx.fillText("다음 라운드 준비 중...",W/2,py+ph-6);
 }
 
@@ -2438,8 +2522,8 @@ function renderScoreboard(){
   const sw=540;
   const t0=entities.filter(e=>e.team===0).sort((a,b)=>(_mst(b.name).k||0)-(_mst(a.name).k||0));
   const t1=entities.filter(e=>e.team===1).sort((a,b)=>(_mst(b.name).k||0)-(_mst(a.name).k||0));
-  const rowH=30, headerH=38, teamLabelH=24, sectionPad=10;
-  const sh=172+(t0.length+t1.length)*rowH;
+  const rowH=38, headerH=38, teamLabelH=28, sectionPad=10;
+  const sh=190+(t0.length+t1.length)*rowH;
   const sx=W/2-sw/2, sy=H/2-sh/2;
 
   // 배경
@@ -2452,10 +2536,10 @@ function renderScoreboard(){
 
   // 제목
   ctx.textAlign="center";
-  ctx.font="bold 13px monospace";
+  ctx.font="bold 15px monospace";
   ctx.fillStyle="#c8d8ec";
   ctx.fillText("SCOREBOARD",W/2,sy+23);
-  ctx.font="11px monospace";
+  ctx.font="15px monospace";
   const [sc0,sc1]=round.scores;
   const myS=player?round.scores[player.team]:sc0;
   const thS=player?round.scores[1-player.team]:sc1;
@@ -2468,19 +2552,19 @@ function renderScoreboard(){
   ctx.strokeStyle="rgba(50,70,110,0.4)";ctx.lineWidth=1;
   ctx.beginPath();ctx.moveTo(sx+10,ry);ctx.lineTo(sx+sw-10,ry);ctx.stroke();
   ry+=4;
-  ctx.textAlign="left";ctx.font="bold 8px monospace";ctx.fillStyle="rgba(110,122,145,0.7)";
+  ctx.textAlign="left";ctx.font="bold 15px monospace";ctx.fillStyle="rgba(110,122,145,0.7)";
   ctx.fillText("NAME",nX,ry+12);
   ctx.textAlign="right";
   ctx.fillText("K",kX,ry+12);ctx.fillText("D",dX,ry+12);ctx.fillText("K/D",kdX,ry+12);ctx.fillText("$",mX,ry+12);
-  ctx.font="7px monospace";ctx.fillStyle="rgba(80,90,105,0.5)";
+  ctx.font="15px monospace";ctx.fillStyle="rgba(80,90,105,0.5)";
   ctx.fillText("매치",kX,ry+22);ctx.fillText("매치",dX,ry+22);
   ry+=teamLabelH;
 
   const drawTeam=(ents,label,teamCol)=>{
     // 팀 레이블
-    ctx.textAlign="left";ctx.font="bold 9px monospace";
+    ctx.textAlign="left";ctx.font="bold 15px monospace";
     ctx.fillStyle=teamCol;ctx.fillText(label,nX,ry+13);
-    ctx.textAlign="right";ctx.font="8px monospace";ctx.fillStyle="rgba(130,138,150,0.5)";
+    ctx.textAlign="right";ctx.font="15px monospace";ctx.fillStyle="rgba(130,138,150,0.5)";
     const tsc=round.scores[ents[0]?.team??0];
     ctx.fillText(`${tsc} wins`,mX,ry+13);
     ry+=teamLabelH;
@@ -2494,14 +2578,14 @@ function renderScoreboard(){
       const em=_mst(e.name);
       const kd=em.d>0?(em.k/em.d).toFixed(2):em.k>0?"∞":"—";
       ctx.textAlign="left";
-      ctx.font=`${isMe?"bold ":""}11px ${isMe?"monospace":"sans-serif"}`;
+      ctx.font=`${isMe?"bold ":""} 15px ${isMe?"monospace":"sans-serif"}`;
       ctx.fillStyle=isMe?"#88c8ff":e.team===0?"#90b8d8":"#d89090";
       ctx.fillText((isMe?"▶ ":"")+e.name,nX,ry+20);
       // 매치 스탯
-      ctx.font="bold 11px monospace";ctx.fillStyle="#dde4ec";ctx.textAlign="right";
+      ctx.font="bold 15px monospace";ctx.fillStyle="#dde4ec";ctx.textAlign="right";
       ctx.fillText(em.k,kX,ry+18);
       // 라운드 킬 (이번 라운드) — 매치킬 아래 작게
-      ctx.font="7px monospace";ctx.fillStyle="rgba(140,148,160,0.4)";
+      ctx.font="15px monospace";ctx.fillStyle="rgba(140,148,160,0.4)";
       ctx.fillText(`R:${e.roundKills}`,kX,ry+27);
       ctx.fillStyle="rgba(195,172,172,0.85)";
       ctx.fillText(em.d,dX,ry+20);
@@ -2520,7 +2604,7 @@ function renderScoreboard(){
   drawTeam(t1,"TEAM  B  (적팀)","#e07070");
 
   // 하단 힌트
-  ctx.textAlign="center";ctx.font="9px monospace";ctx.fillStyle="rgba(80,90,105,0.55)";
+  ctx.textAlign="center";ctx.font="15px monospace";ctx.fillStyle="rgba(80,90,105,0.55)";
   ctx.fillText("Tab  유지시 표시",W/2,ry+18);
 }
 
@@ -2551,63 +2635,121 @@ function connectToServer(){
 function handleNetMessage(ev){
   let msg;try{msg=JSON.parse(ev.data);}catch{return;}
   switch(msg.type){
-    case 'created': lobbyCode=msg.code; netState="waiting"; break;
-    case 'joined':  netState="waiting"; break;
-    case 'start':   mySlot=msg.yourSlot; round.n=0; round.scores=[0,0]; startOnlineGame(); break;
-    case 'state':   if(remoteEntity)updateRemoteEntity(msg); break;
-    case 'hit':     if(player&&player.alive)applyDamage(player,msg.dmg,msg.head,remoteEntity); break;
+    case 'created':
+      lobbyCode=msg.code; netState="waiting";
+      gameMode=msg.mode||"1v1"; netMaxSlots=msg.maxSlots||2; lobbyFilledSlots=1; break;
+    case 'waiting':
+      lobbyFilledSlots=msg.filled; netMaxSlots=msg.maxSlots; break;
+    case 'start':
+      mySlot=msg.yourSlot; gameMode=msg.mode||"1v1"; netMaxSlots=msg.maxSlots||2;
+      round.n=0; round.scores=[0,0]; startOnlineGame(); break;
+    case 'state':   updateRemoteSlot(msg); break;
+    case 'hit':
+      if(gameMode==="1v1"&&player&&player.alive)applyDamage(player,msg.dmg,msg.head,remoteEntity); break;
+    case 'playerHit':
+      if(msg.targetSlot===mySlot&&player&&player.alive)applyDamage(player,msg.dmg,msg.head,null); break;
     case 'shot':    handleRemoteShot(msg); break;
+    case 'botstate':  if(!isCoopHost)updateBotStates(msg.bots); break;
+    case 'botHit':    if(isCoopHost)handleBotHitFromGuest(msg); break;
+    case 'botShot':   if(!isCoopHost)handleRemoteBotShot(msg); break;
+    case 'coopKill':  handleCoopKill(msg); break;
     case 'restart': if(netState==="playing")startOnlineGame(); break;
     case 'pong':    break;
-    case 'disconnect': addFeed("상대방 연결 끊김"); netState="disconnected"; break;
+    case 'disconnect':
+      if(gameMode==="1v1"){
+        addFeed("상대방 연결 끊김"); netState="disconnected";
+      }else{
+        const dcE=remoteEntities[msg.slot];
+        if(dcE){addFeed(`플레이어${(msg.slot||0)+1} 연결 끊김`);dcE.alive=false;}
+      }
+      break;
     case 'error':   addFeed(msg.msg||"연결 오류"); netState="lobby"; break;
+  }
+}
+
+function _setupPlayerWeapon(e){
+  e.weaponKey=chosenWeapon;
+  if(chosenWeapon==="awp"){
+    e.ammo={awp:{mag:CONFIG.weapons.awp.mag,reserve:CONFIG.weapons.awp.reserve},
+            pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}};
+    e.prevKey="pistol";
+  }else if(chosenWeapon==="smg"){
+    e.ammo={smg:{mag:CONFIG.weapons.smg.mag,reserve:CONFIG.weapons.smg.reserve},
+            pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}};
+    e.prevKey="pistol";
+  }else{
+    e.ammo={ak:{mag:CONFIG.weapons.ak.mag,reserve:CONFIG.weapons.ak.reserve},
+            pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}};
+    e.prevKey="pistol";
   }
 }
 
 function startOnlineGame(){
   netState="playing";
+  isCoopHost=(mySlot===0&&gameMode!=="1v1");
+  coopBotTimer=0;
   const prevMoney=player?player.money:0;
   const isFirstGame=(round.n===0);
   entities.length=0;corpses.length=0;drops.length=0;rings.length=0;floatTexts.length=0;
   tracers.length=0;particles.length=0;flashes.length=0;bloodStains.length=0;
-  scoped=false;scopeZoom=3.2;killSlowT=0;killFlash=0;timeScale=1;deathT=0;setDeathAudio(false);
+  scoped=false;scopeZoom=3.2;killSlowT=0;killFlash=0;timeScale=1;deathT=0;deathKiller=null;setDeathAudio(false);
   roll={active:false,t:0,dirX:0,dirY:0,cd:0,chainWin:0};
   round.scored=false;round.result=null;
+  remoteEntities={};
 
-  const sp=spawns[mySlot][1];
-  player=makeEntity(mySlot,sp.x,sp.y,false,"나");
-  player.weaponKey=chosenWeapon;
-  if(chosenWeapon==="awp"){
-    player.ammo={awp:{mag:CONFIG.weapons.awp.mag,reserve:CONFIG.weapons.awp.reserve},
-                 pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}};
-    player.prevKey="pistol";
-  }else if(chosenWeapon==="smg"){
-    player.ammo={smg:{mag:CONFIG.weapons.smg.mag,reserve:CONFIG.weapons.smg.reserve},
-                 pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}};
-    player.prevKey="pistol";
+  if(gameMode==="1v1"){
+    // ── 1vs1 (기존 로직 유지) ─────────────────────
+    const sp=spawns[mySlot][1];
+    player=makeEntity(mySlot,sp.x,sp.y,false,"나");
+    _setupPlayerWeapon(player);
+    player.money=isFirstGame?CONFIG.economy.start:prevMoney;
+    player.roundKills=0;player.roundHeads=0;player.roundKnifeKills=0;player.maxKillDist=0;player.roundDeaths=0;
+    entities.push(player);
+    const rsp=spawns[1-mySlot][1];
+    remoteEntity=makeEntity(1-mySlot,rsp.x,rsp.y,false,"상대");
+    remoteEntity.isBot=false;
+    entities.push(remoteEntity);
+    remoteEntities={[1-mySlot]:remoteEntity};
+    round.n++;round.state="play";round.t=0;
+    gameState="game";
+    addFeed("게임 시작! 상대방과 연결됨");
   }else{
-    player.ammo={ak:{mag:CONFIG.weapons.ak.mag,reserve:CONFIG.weapons.ak.reserve},
-                 pistol:{mag:CONFIG.weapons.pistol.mag,reserve:CONFIG.weapons.pistol.reserve}};
+    // ── 협동 모드 ─────────────────────────────────
+    remoteEntity=null;
+    // 내 플레이어 (팀 0, 슬롯 위치에 스폰)
+    const sp=spawns[0][mySlot]||spawns[0][0];
+    player=makeEntity(0,sp.x,sp.y,false,mySlot===0?"나(호스트)":"나");
+    _setupPlayerWeapon(player);
+    player.money=isFirstGame?CONFIG.economy.start:prevMoney;
+    player.roundKills=0;player.roundHeads=0;player.roundKnifeKills=0;player.maxKillDist=0;player.roundDeaths=0;
+    entities.push(player);
+    // 원격 인간 플레이어 (팀 0)
+    for(let s=0;s<netMaxSlots;s++){
+      if(s===mySlot)continue;
+      const rsp=spawns[0][s]||spawns[0][0];
+      const re=makeEntity(0,rsp.x,rsp.y,false,`플레이어${s+1}`);
+      re.isBot=false;
+      entities.push(re);
+      remoteEntities[s]=re;
+    }
+    // 봇 (팀 1) — 호스트만 AI 실행, 게스트는 위치만 수신
+    const numBots=gameMode==="coop3"?4:3;
+    for(let i=0;i<numBots;i++){
+      const bsp=spawns[1][i]||spawns[1][i%3];
+      const b=makeEntity(1,bsp.x,bsp.y,isCoopHost,`적${i+1}`);
+      if(!isCoopHost)b.isBot=false;
+      entities.push(b);
+    }
+    round.n++;round.state="pre";round.t=CONFIG.round.preTime;
+    gameState="game";
+    addFeed(`협동 ${netMaxSlots}인 게임 시작!`+(isCoopHost?" (호스트)":""));
   }
-  // 첫 게임이면 시작 자금, 이후엔 이전 라운드 잔액 유지
-  player.money=isFirstGame?CONFIG.economy.start:prevMoney;
-  player.roundKills=0;player.roundHeads=0;player.roundKnifeKills=0;player.maxKillDist=0;player.roundDeaths=0;
-  entities.push(player);
-
-  const rsp=spawns[1-mySlot][1];
-  remoteEntity=makeEntity(1-mySlot,rsp.x,rsp.y,false,"상대");
-  remoteEntity.isBot=false;
-  entities.push(remoteEntity);
-
-  round.n++;round.state="play";round.t=0;
-  gameState="game";
-  addFeed("게임 시작! 상대방과 연결됨");
 }
 
 function sendPlayerState(){
   if(!ws||ws.readyState!==1||!player)return;
   ws.send(JSON.stringify({
-    type:'state',
+    type:'state',slot:mySlot,
     x:Math.round(player.x),y:Math.round(player.y),
     angle:+player.angle.toFixed(3),
     hp:player.hp,alive:player.alive,
@@ -2616,29 +2758,32 @@ function sendPlayerState(){
   }));
 }
 
-function updateRemoteEntity(msg){
-  if(!remoteEntity)return;
-  remoteEntity.x=msg.x; remoteEntity.y=msg.y; remoteEntity.angle=msg.angle;
-  remoteEntity.hp=msg.hp; remoteEntity.weaponKey=msg.wk||remoteEntity.weaponKey;
-  remoteEntity.reloading=msg.reload?1:0;
-  if(msg.alive===false&&remoteEntity.alive){
-    remoteEntity.alive=false;remoteEntity.hp=0;
-    corpses.push({x:remoteEntity.x,y:remoteEntity.y,angle:remoteEntity.angle,team:remoteEntity.team,weapon:remoteEntity.weaponKey,age:0});
+function updateRemoteSlot(msg){
+  const ent=gameMode==="1v1"?remoteEntity:remoteEntities[msg.slot];
+  if(!ent)return;
+  ent.x=msg.x;ent.y=msg.y;ent.angle=msg.angle;
+  ent.hp=msg.hp;ent.weaponKey=msg.wk||ent.weaponKey;
+  ent.reloading=msg.reload?1:0;
+  if(msg.alive===false&&ent.alive){
+    ent.alive=false;ent.hp=0;
+    corpses.push({x:ent.x,y:ent.y,angle:ent.angle,team:ent.team,weapon:ent.weaponKey,age:0});
     sfx.death();
-    addFeed("나 ☠ 상대");
-    // 1v1 온라인: 상대 사망 = 내가 처치 → 크레딧 부여
-    if(player&&player.alive){
-      const eco=CONFIG.economy;
-      player.money+=eco.kill;
-      player.roundKills++;player.totalKills++;
-      _mst(player.name).k++;_mst(remoteEntity.name).d++;
-      killSlowT=CONFIG.killEffect.slowDur;killFlash=0.45;sfx.killConfirm();
-      shake=Math.max(shake,2.5);
-      floatTexts.push({wx:remoteEntity.x,wy:remoteEntity.y-10,t:0,life:1.6,vy:-50,
-        text:`KILL  +${eco.kill}`,color:"#4cd47a",size:18});
+    if(gameMode==="1v1"){
+      addFeed("나 ☠ 상대");
+      if(player&&player.alive){
+        const eco=CONFIG.economy;
+        player.money+=eco.kill;
+        player.roundKills++;player.totalKills++;
+        _mst(player.name).k++;_mst(ent.name).d++;
+        killSlowT=CONFIG.killEffect.slowDur;killFlash=0.45;sfx.killConfirm();
+        shake=Math.max(shake,2.5);
+        floatTexts.push({wx:ent.x,wy:ent.y-10,t:0,life:1.6,vy:-50,text:`KILL  +${eco.kill}`,color:"#4cd47a",size:18});
+      }
+    }else{
+      addFeed(`${ent.name} 사망`);
     }
-  }else if(msg.alive!==false&&!remoteEntity.alive){
-    remoteEntity.alive=true;remoteEntity.hp=msg.hp;
+  }else if(msg.alive!==false&&!ent.alive){
+    ent.alive=true;ent.hp=msg.hp;
   }
   if(msg.sc){
     round.scores[0]=Math.max(round.scores[0],msg.sc[0]);
@@ -2646,13 +2791,72 @@ function updateRemoteEntity(msg){
   }
 }
 
-function handleRemoteShot(msg){
-  if(!remoteEntity)return;
-  sfx.shot(msg.wk,volByDist(remoteEntity));
+// ── 협동 전용 함수들 ──────────────────────────────
+function sendBotStates(){
+  if(!ws||ws.readyState!==1)return;
+  const bots=entities.filter(e=>e.team===1).map((e,i)=>({
+    i,x:Math.round(e.x),y:Math.round(e.y),a:+e.angle.toFixed(3),
+    hp:Math.round(e.hp),alive:e.alive,wk:e.weaponKey
+  }));
+  ws.send(JSON.stringify({type:'botstate',bots}));
+}
+
+function updateBotStates(bots){
+  if(!bots)return;
+  const botEnts=entities.filter(e=>e.team===1);
+  bots.forEach(b=>{
+    const ent=botEnts[b.i];if(!ent)return;
+    ent.x=b.x;ent.y=b.y;ent.angle=b.a;ent.hp=b.hp;
+    ent.weaponKey=b.wk||ent.weaponKey;
+    if(b.alive===false&&ent.alive){
+      ent.alive=false;ent.hp=0;
+      corpses.push({x:ent.x,y:ent.y,angle:ent.angle,team:ent.team,weapon:ent.weaponKey,age:0});
+      addBlood(ent.x,ent.y,12);sfx.death();
+    }else if(b.alive===true&&!ent.alive){
+      ent.alive=true;ent.hp=b.hp;
+    }
+  });
+}
+
+function handleBotHitFromGuest(msg){
+  const bots=entities.filter(e=>e.team===1);
+  const bot=bots[msg.botIdx];
+  if(!bot||!bot.alive)return;
+  const killer=remoteEntities[msg.killerSlot]||null;
+  applyDamage(bot,msg.dmg,msg.head,killer);
+}
+
+function handleRemoteBotShot(msg){
   const tLife=rand(0.8,1.0);
   tracers.push({x1:msg.ox,y1:msg.oy,x2:msg.ex,y2:msg.ey,t:tLife,life:tLife});
   flashes.push({x:msg.ox,y:msg.oy,ang:Math.atan2(msg.ey-msg.oy,msg.ex-msg.ox),t:0.05});
-  emitNoise(msg.ox,msg.oy,CONFIG.weapons[msg.wk]?.noise||500,remoteEntity.team,"shot");
+  sfx.shot(msg.wk,volByDist({x:msg.ox,y:msg.oy}));
+  emitNoise(msg.ox,msg.oy,CONFIG.weapons[msg.wk]?.noise||500,1,"shot");
+}
+
+function handleCoopKill(msg){
+  if(msg.killerSlot!==mySlot||!player)return;
+  const eco=CONFIG.economy;
+  const bonus=msg.head?eco.head:0;
+  player.money+=eco.kill+bonus;
+  player.roundKills++;player.totalKills++;
+  if(msg.head){player.roundHeads++;player.totalHeads++;}
+  _mst(player.name).k++;
+  killSlowT=CONFIG.killEffect.slowDur;killFlash=0.45;sfx.killConfirm();
+  shake=Math.max(shake,2.5);
+  floatTexts.push({wx:player.x,wy:player.y-28,t:0,life:1.6,vy:-40,
+    text:`KILL +${eco.kill}${bonus?` +${bonus}(헤드)`:""}`,color:"#4cd47a",size:16});
+}
+
+function handleRemoteShot(msg){
+  const shooter=gameMode==="1v1"?remoteEntity:remoteEntities[msg.slot];
+  const team=shooter?shooter.team:0;
+  if(!shooter&&gameMode==="1v1")return;
+  sfx.shot(msg.wk,volByDist(shooter||{x:msg.ox,y:msg.oy}));
+  const tLife=rand(0.8,1.0);
+  tracers.push({x1:msg.ox,y1:msg.oy,x2:msg.ex,y2:msg.ey,t:tLife,life:tLife});
+  flashes.push({x:msg.ox,y:msg.oy,ang:Math.atan2(msg.ey-msg.oy,msg.ex-msg.ox),t:0.05});
+  emitNoise(msg.ox,msg.oy,CONFIG.weapons[msg.wk]?.noise||500,team,"shot");
 }
 
 /* -------- 로비 UI -------- */
@@ -2662,20 +2866,22 @@ function drawBtn(x,y,w,h,label,col){
   ctx.strokeStyle=hov?col+"ff":col+"99";
   ctx.lineWidth=1.5;
   rr(x,y,w,h,8);ctx.fill();ctx.stroke();
-  ctx.font="bold 14px monospace";ctx.textAlign="center";
+  ctx.font="bold 15px monospace";ctx.textAlign="center";
   ctx.fillStyle=hov?"#ffffff":col+"ee";
   ctx.fillText(label,x+w/2,y+h/2+5);
 }
 function renderLobby(){
   ctx.textAlign="center";
-  // 타이틀
+  // 타이틀 (선택된 모드에 따라 변경)
+  const _mLabel=lobbyGameMode==="coop3"?"협동 3인 vs AI":lobbyGameMode==="coop2"?"협동 2인 vs AI":"온라인 1 vs 1";
+  const _mDesc=lobbyGameMode!=="1v1"?"방 코드를 팀원과 공유하여 협동 플레이":"방 코드를 상대방과 공유하여 1 vs 1 대전";
   ctx.font="bold 38px monospace";ctx.fillStyle="#dfe6ef";
-  ctx.fillText("온라인 대전",W/2,H/2-180);
-  ctx.font="13px sans-serif";ctx.fillStyle="#5a7a8a";
-  ctx.fillText("방 코드를 상대방과 공유하여 1 vs 1 대전",W/2,H/2-146);
+  ctx.fillText(_mLabel,W/2,H/2-180);
+  ctx.font="15px sans-serif";ctx.fillStyle="#5a7a8a";
+  ctx.fillText(_mDesc,W/2,H/2-146);
 
   // 무기 선택
-  ctx.font="11px sans-serif";ctx.fillStyle="#3a5a6a";ctx.fillText("무기 선택",W/2,H/2-123);
+  ctx.font="15px sans-serif";ctx.fillStyle="#3a5a6a";ctx.fillText("무기 선택",W/2,H/2-123);
   const _lbwChoices=[{key:"ak",label:"AK-47"},{key:"smg",label:"SMG"},{key:"awp",label:"AWP"}];
   _lbwChoices.forEach((wc,i)=>{
     const bx=W/2-150+i*100,by=H/2-115;
@@ -2683,7 +2889,7 @@ function renderLobby(){
     ctx.fillStyle=sel?"rgba(60,140,220,0.35)":"rgba(20,40,60,0.45)";
     ctx.strokeStyle=sel?"#5ab0ee":"#2a4a6a";ctx.lineWidth=sel?2:1;
     rr(bx,by,90,34,6);ctx.fill();ctx.stroke();
-    ctx.font=(sel?"bold ":"")+"13px monospace";ctx.textAlign="center";
+    ctx.font=(sel?"bold ":"")+"15px monospace";ctx.textAlign="center";
     ctx.fillStyle=sel?"#88d8ff":"#4a7a9a";
     ctx.fillText(wc.label,bx+45,by+22);
   });
@@ -2691,7 +2897,7 @@ function renderLobby(){
   ctx.beginPath();ctx.moveTo(W/2-200,H/2-72);ctx.lineTo(W/2+200,H/2-72);ctx.stroke();
 
   if(netState==="connecting"){
-    ctx.font="18px sans-serif";ctx.fillStyle="#6a8aaa";
+    ctx.font="15px sans-serif";ctx.fillStyle="#6a8aaa";
     ctx.fillText("서버 연결 중...",W/2,H/2-20);
     const d=Date.now()/1000;
     for(let i=0;i<8;i++){
@@ -2700,13 +2906,13 @@ function renderLobby(){
       ctx.beginPath();ctx.arc(W/2+Math.cos(a)*28,H/2+28+Math.sin(a)*28,4,0,TAU);ctx.fill();
     }
   }else if(netState==="error"){
-    ctx.font="16px sans-serif";ctx.fillStyle="#c06060";
+    ctx.font="15px sans-serif";ctx.fillStyle="#c06060";
     ctx.fillText("서버 연결 실패",W/2,H/2-40);
-    ctx.font="12px sans-serif";ctx.fillStyle="#7a5050";
+    ctx.font="15px sans-serif";ctx.fillStyle="#7a5050";
     ctx.fillText(SERVER_URL,W/2,H/2-18);
     drawBtn(W/2-100,H/2+10,200,44,"다시 시도","#884444");
   }else if(netState==="lobby"){
-    ctx.font="13px sans-serif";ctx.fillStyle="#4a6a7a";
+    ctx.font="15px sans-serif";ctx.fillStyle="#4a6a7a";
     ctx.fillText("방을 만들거나 상대방 코드를 입력하세요",W/2,H/2-50);
     drawBtn(W/2-200,H/2-20,185,52,"방 만들기","#2a5a9a");
     drawBtn(W/2+15,H/2-20,185,52,"방 참가","#1a6040");
@@ -2719,7 +2925,7 @@ function renderLobby(){
       drawBtn(W/2-55,H/2+108,110,34,"▶ 입장","#1a6040");
     }
   }else if(netState==="waiting"){
-    ctx.font="14px sans-serif";ctx.fillStyle="#5a8a9a";
+    ctx.font="15px sans-serif";ctx.fillStyle="#5a8a9a";
     ctx.fillText("이 코드를 상대방에게 알려주세요",W/2,H/2-80);
     const codeHov=inBtn(W/2-160,H/2-60,320,80);
     ctx.fillStyle=codeHov?"rgba(18,40,58,0.95)":"rgba(10,20,30,0.85)";
@@ -2729,13 +2935,14 @@ function renderLobby(){
     ctx.letterSpacing="8px";
     ctx.fillText(lobbyCode,W/2,H/2+14);
     ctx.letterSpacing="0px";
-    ctx.font="10px sans-serif";ctx.fillStyle=codeHov?"rgba(100,200,255,0.9)":"rgba(80,140,180,0.5)";
+    ctx.font="15px sans-serif";ctx.fillStyle=codeHov?"rgba(100,200,255,0.9)":"rgba(80,140,180,0.5)";
     ctx.fillText("클릭하면 복사",W/2,H/2+46);
     const dots=[" ","."," .","  ."," . ."][Math.floor(Date.now()/400)%5];
     ctx.font="15px sans-serif";ctx.fillStyle="#5a8a9a";
-    ctx.fillText("상대방 대기 중"+dots,W/2,H/2+100);
+    const _waitLabel=lobbyGameMode!=="1v1"?`${lobbyFilledSlots} / ${netMaxSlots} 플레이어 접속 중${dots}`:`상대방 대기 중${dots}`;
+    ctx.fillText(_waitLabel,W/2,H/2+100);
   }else if(netState==="disconnected"){
-    ctx.font="16px sans-serif";ctx.fillStyle="#c08060";
+    ctx.font="15px sans-serif";ctx.fillStyle="#c08060";
     ctx.fillText("상대방이 연결을 끊었습니다",W/2,H/2-20);
     drawBtn(W/2-100,H/2+20,200,44,"다시 연결","#885533");
   }
@@ -2777,12 +2984,12 @@ function renderKeyGuide(){
     ctx.fillText(label,bx+kw/2,by+kh*0.64);
   };
   const L=(bx,by,txt,col)=>{
-    ctx.font="11px sans-serif";ctx.fillStyle=col||"#4a7a98";
+    ctx.font="15px sans-serif";ctx.fillStyle=col||"#4a7a98";
     ctx.textAlign="left";ctx.fillText(txt,bx,by);
   };
   // MOVEMENT
   const ox=px+28,oy=py+68;
-  ctx.font="bold 9px monospace";ctx.fillStyle="#22547a";ctx.textAlign="left";
+  ctx.font="bold 15px monospace";ctx.fillStyle="#22547a";ctx.textAlign="left";
   ctx.fillText("이 동 / 구 르 기",ox,oy-10);
   K(ox+KW+KG,      oy,           KW,KH,"W");
   K(ox,             oy+KH+KG,     KW,KH,"A");
@@ -2795,7 +3002,7 @@ function renderKeyGuide(){
   L(ox+KW*3+KG*2+8, oy+(KH+KG)*3+Math.round(KH*0.62),"구르기","#4a88b8");
   // COMBAT
   const cx2=px+246,cy2=py+68;
-  ctx.font="bold 9px monospace";ctx.fillStyle="#22547a";ctx.textAlign="left";
+  ctx.font="bold 15px monospace";ctx.fillStyle="#22547a";ctx.textAlign="left";
   ctx.fillText("전 투 / 기 타",cx2,cy2-10);
   K(cx2,cy2,           KW,KH,"Q"); L(cx2+KW+7,cy2+Math.round(KH*0.62),"무기 교체","#4a88b8");
   K(cx2,cy2+KH+KG,     KW,KH,"R"); L(cx2+KW+7,cy2+KH+KG+Math.round(KH*0.62),"재장전","#4a88b8");
@@ -2806,7 +3013,7 @@ function renderKeyGuide(){
   // MOUSE
   const mox=px+pw-148,moy=py+68;
   const mbw=60,mbh=84,mbr=18;
-  ctx.font="bold 9px monospace";ctx.fillStyle="#22547a";ctx.textAlign="left";
+  ctx.font="bold 15px monospace";ctx.fillStyle="#22547a";ctx.textAlign="left";
   ctx.fillText("마 우 스",mox,moy-10);
   ctx.fillStyle="rgba(8,16,30,0.97)";ctx.strokeStyle="#182e4a";ctx.lineWidth=1.5;
   rr(mox,moy,mbw,mbh,mbr);ctx.fill();ctx.stroke();
@@ -2826,15 +3033,15 @@ function renderKeyGuide(){
   ctx.beginPath();ctx.moveTo(mox+mbw/2,moy+3);ctx.lineTo(mox+mbw/2,moy+mbh*0.43);ctx.stroke();
   ctx.fillStyle="rgba(14,28,52,0.97)";ctx.strokeStyle="#162a44";ctx.lineWidth=1;
   rr(mox+mbw/2-5,moy+Math.round(mbh*0.13),10,18,3);ctx.fill();ctx.stroke();
-  ctx.font="bold 10px monospace";ctx.textAlign="center";
+  ctx.font="bold 15px monospace";ctx.textAlign="center";
   ctx.fillStyle="#78bcf0";ctx.fillText("L",mox+mbw*0.27,moy+Math.round(mbh*0.26));
   ctx.fillStyle="#3a6898";ctx.fillText("R",mox+mbw*0.73,moy+Math.round(mbh*0.26));
   L(mox,moy+mbh+16,"좌클릭  사격","#68b8f0");
   L(mox,moy+mbh+32,"우클릭  집중사격 / AWP: 조준경","#3a88c8");
   L(mox,moy+mbh+48,"       칼: 찌르기","#2a6898");
-  ctx.font="10px sans-serif";ctx.fillStyle="#2a5070";ctx.textAlign="center";
+  ctx.font="15px sans-serif";ctx.fillStyle="#2a5070";ctx.textAlign="center";
   ctx.fillText("칼 장비: 좌클릭 = 베기(레이더)   |   우클릭 = 찌르기   |   구르기 = 베기 공격",W/2,py+ph-46);
-  ctx.font="11px sans-serif";ctx.fillStyle="rgba(45,75,100,0.9)";
+  ctx.font="15px sans-serif";ctx.fillStyle="rgba(45,75,100,0.9)";
   ctx.fillText("ESC 또는 클릭하면 닫힙니다",W/2,py+ph-22);
   ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,4,0,TAU);ctx.fill();
   ctx.fillStyle="#0af";ctx.beginPath();ctx.arc(mouse.x,mouse.y,2,0,TAU);ctx.fill();
@@ -2846,7 +3053,7 @@ function renderMenu(){
   ctx.fillStyle="#dfe6ef";
   ctx.font="bold 58px monospace";
   ctx.fillText("BLOCK WAR",W/2,H/2-168);
-  ctx.font="13px sans-serif";ctx.fillStyle="#6a8a9a";
+  ctx.font="15px sans-serif";ctx.fillStyle="#6a8a9a";
   ctx.fillText("적을 찾아라  ·  들어라  ·  예측하라  ·  먼저 쏴라",W/2,H/2-124);
 
   // 구분선
@@ -2854,7 +3061,7 @@ function renderMenu(){
   ctx.beginPath();ctx.moveTo(W/2-220,H/2-106);ctx.lineTo(W/2+220,H/2-106);ctx.stroke();
 
   const bw=480,bh=70,bx=W/2-bw/2;
-  ctx.font="bold 12px monospace";ctx.fillStyle="#4a6070";
+  ctx.font="bold 15px monospace";ctx.fillStyle="#4a6070";
   ctx.fillText("▲ ▼  모드 선택     Enter 또는 클릭",W/2,H/2-90);
 
   gameModes.forEach((m,i)=>{
@@ -2877,16 +3084,16 @@ function renderMenu(){
     ctx.fillStyle=dim?"#3a4a5a":(sel?"#7ab8ee":"#8aa8c8");
     ctx.fillText(m.label,bx+24,by+30);
     // 설명
-    ctx.font="12px sans-serif";
+    ctx.font="15px sans-serif";
     ctx.fillStyle=dim?"#2e3a46":"#445566";
     ctx.fillText(m.desc,bx+24,by+52);
     // 준비중 뱃지
     if(dim){
-      ctx.font="bold 10px monospace";ctx.fillStyle="#334455";
+      ctx.font="bold 15px monospace";ctx.fillStyle="#334455";
       const tw=ctx.measureText("준비중").width+16;
       ctx.fillStyle="rgba(40,55,70,0.9)";
       rr(bx+bw-tw-14,by+24,tw,22,4);ctx.fill();
-      ctx.fillStyle="#4a6070";ctx.font="bold 10px monospace";ctx.textAlign="left";
+      ctx.fillStyle="#4a6070";ctx.font="bold 15px monospace";ctx.textAlign="left";
       ctx.fillText("준비중",bx+bw-tw-6,by+39);
     }
     // 선택 화살표
@@ -2903,9 +3110,9 @@ function renderMenu(){
   ctx.fillStyle=kgHov?"rgba(20,55,95,0.92)":"rgba(10,28,52,0.82)";
   ctx.strokeStyle=kgHov?"#4a8aca":"#1e4060";ctx.lineWidth=1.5;
   rr(kgbx,kgby,kgbw,kgbh,6);ctx.fill();ctx.stroke();
-  ctx.font="bold 11px monospace";ctx.fillStyle=kgHov?"#88d8ff":"#3a88cc";
+  ctx.font="bold 15px monospace";ctx.fillStyle=kgHov?"#88d8ff":"#3a88cc";
   ctx.textAlign="center";ctx.fillText("⌨  키 안내",W/2,kgby+kgbh*0.65);
-  ctx.font="11px sans-serif";ctx.fillStyle="rgba(60,80,100,0.7)";
+  ctx.font="15px sans-serif";ctx.fillStyle="rgba(60,80,100,0.7)";
   ctx.fillText("© BLOCK WAR ALPHA  —  eser.lbs@gmail.com",W/2,H-16);
   ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,3,0,TAU);ctx.fill();
 }
@@ -2943,9 +3150,9 @@ function renderPause(){
   ctx.fillStyle=hov3?"rgba(20,55,95,0.92)":"rgba(10,28,52,0.82)";
   ctx.strokeStyle=hov3?"#4a8aca":"#1e4060";ctx.lineWidth=1.5;
   rr(bx2,H/2+96,bw,34,8);ctx.fill();ctx.stroke();
-  ctx.font="bold 12px monospace";ctx.fillStyle=hov3?"#88d8ff":"#3a88cc";
+  ctx.font="bold 15px monospace";ctx.fillStyle=hov3?"#88d8ff":"#3a88cc";
   ctx.fillText("⌨  키 안내",W/2,H/2+118);
-  ctx.font="11px sans-serif";ctx.fillStyle="rgba(80,100,120,0.7)";
+  ctx.font="15px sans-serif";ctx.fillStyle="rgba(80,100,120,0.7)";
   ctx.fillText("ESC — 계속하기",W/2,py+ph-14);
   ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,4,0,TAU);ctx.fill();
   ctx.fillStyle="#0af";ctx.beginPath();ctx.arc(mouse.x,mouse.y,2,0,TAU);ctx.fill();
@@ -2956,7 +3163,7 @@ function renderTitle(){
   ctx.fillStyle="#dfe6ef";
   ctx.font="bold 46px monospace";
   ctx.fillText("대전 모드 — 무기 선택",W/2,H/2-148);
-  ctx.font="13px sans-serif";ctx.fillStyle="#6a8a9a";
+  ctx.font="15px sans-serif";ctx.fillStyle="#6a8a9a";
   ctx.fillText("▲ ▼ 무기 선택    Enter 또는 클릭으로 시작",W/2,H/2-108);
 
   const bw=420,bh=60,bx=W/2-bw/2;
@@ -2972,17 +3179,17 @@ function renderTitle(){
     ctx.font=`bold ${sel?20:17}px monospace`;
     ctx.fillStyle=sel?"#5ba0ff":"#9fb3c8";
     ctx.fillText(wc.label,bx+22,by+26);
-    ctx.font="12px sans-serif";ctx.fillStyle=sel?"#8ab4d4":"#556677";
+    ctx.font="15px sans-serif";ctx.fillStyle=sel?"#8ab4d4":"#556677";
     ctx.fillText(wc.desc,bx+22,by+45);
     if(sel){
       ctx.textAlign="right";
-      ctx.font="bold 18px monospace";ctx.fillStyle="#5ba0ff";
+      ctx.font="bold 15px monospace";ctx.fillStyle="#5ba0ff";
       ctx.fillText("▶",bx+bw-16,by+36);
     }
     ctx.textAlign="center";
   });
 
-  ctx.font="12px sans-serif";ctx.fillStyle="rgba(70,90,110,0.7)";ctx.textAlign="center";
+  ctx.font="15px sans-serif";ctx.fillStyle="rgba(70,90,110,0.7)";ctx.textAlign="center";
   ctx.fillText("WASD 이동  ·  Shift 걷기  ·  Space 구르기  ·  F 줍기  ·  G 버리기  ·  ESC 일시정지",W/2,H/2+190);
 
   // 뒤로가기 버튼
@@ -2991,7 +3198,7 @@ function renderTitle(){
   ctx.fillStyle=bbHov?"rgba(30,45,60,0.95)":"rgba(16,24,34,0.85)";
   ctx.strokeStyle=bbHov?"#3a6080":"#233040";ctx.lineWidth=1.5;
   rr(bbx,bby,bbw,bbh,6);ctx.fill();ctx.stroke();
-  ctx.font="bold 13px monospace";ctx.fillStyle=bbHov?"#7ab8e0":"#4a7090";
+  ctx.font="bold 15px monospace";ctx.fillStyle=bbHov?"#7ab8e0":"#4a7090";
   ctx.fillText("← 뒤로가기",W/2,bby+24);
 
   ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,3,0,TAU);ctx.fill();
