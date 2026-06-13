@@ -65,7 +65,7 @@ wss.on('connection', ws => {
         // 아직 대기 중 → 현재 인원 알림 (전원에게)
         room.slots.forEach((s, i) => {
           if (s && s.readyState === WebSocket.OPEN) {
-            s.send(JSON.stringify({ type: 'waiting', filled, maxSlots: room.maxSlots, yourSlot: i }));
+            s.send(JSON.stringify({ type: 'waiting', filled, maxSlots: room.maxSlots, mode: room.mode, yourSlot: i }));
           }
         });
       }

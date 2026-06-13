@@ -505,7 +505,7 @@ function fireHitscan(shooter,wp,ang){
         // 협동 호스트의 봇이 게스트 플레이어 피격
         const tSlot=Object.keys(remoteEntities).find(s=>remoteEntities[s]===best.e);
         if(tSlot!==undefined){
-          ws.send(JSON.stringify({type:'playerHit',targetSlot:+tSlot,dmg,head}));
+          ws.send(JSON.stringify({type:'playerHit',targetSlot:+tSlot,dmg,head,killerName:shooter.name,killerWeapon:shooter.weaponKey}));
           // 호스트 내 원격 플레이어 상태도 반영
           applyDamage(best.e,dmg,head,shooter);
           skipApply=true;
@@ -2625,8 +2625,10 @@ function connectToServer(){
     ws.onerror=()=>{netState="error";};
     ws.onclose=()=>{
       _stopHB();
-      if(netState==="playing"){addFeed("상대방 연결 끊김");netState="disconnected";}
-      else if(netState!=="idle")netState="error";
+      if(netState==="playing"){
+        addFeed(gameMode==="1v1"?"상대방 연결 끊김":"서버 연결 끊김");
+        netState="disconnected";
+      }else if(netState!=="idle")netState="error";
     };
     ws.onmessage=handleNetMessage;
   }catch(e){netState="error";}
@@ -2639,7 +2641,8 @@ function handleNetMessage(ev){
       lobbyCode=msg.code; netState="waiting";
       gameMode=msg.mode||"1v1"; netMaxSlots=msg.maxSlots||2; lobbyFilledSlots=1; break;
     case 'waiting':
-      lobbyFilledSlots=msg.filled; netMaxSlots=msg.maxSlots; break;
+      lobbyFilledSlots=msg.filled; netMaxSlots=msg.maxSlots;
+      if(msg.mode)lobbyGameMode=msg.mode; break;
     case 'start':
       mySlot=msg.yourSlot; gameMode=msg.mode||"1v1"; netMaxSlots=msg.maxSlots||2;
       round.n=0; round.scores=[0,0]; startOnlineGame(); break;
@@ -2647,7 +2650,11 @@ function handleNetMessage(ev){
     case 'hit':
       if(gameMode==="1v1"&&player&&player.alive)applyDamage(player,msg.dmg,msg.head,remoteEntity); break;
     case 'playerHit':
-      if(msg.targetSlot===mySlot&&player&&player.alive)applyDamage(player,msg.dmg,msg.head,null); break;
+      if(msg.targetSlot===mySlot&&player&&player.alive){
+        applyDamage(player,msg.dmg,msg.head,null);
+        if(!player.alive&&msg.killerName)deathKiller={name:msg.killerName,weapon:msg.killerWeapon||'ak'};
+      }
+      break;
     case 'shot':    handleRemoteShot(msg); break;
     case 'botstate':  if(!isCoopHost)updateBotStates(msg.bots); break;
     case 'botHit':    if(isCoopHost)handleBotHitFromGuest(msg); break;
@@ -2812,6 +2819,8 @@ function updateBotStates(bots){
       ent.alive=false;ent.hp=0;
       corpses.push({x:ent.x,y:ent.y,angle:ent.angle,team:ent.team,weapon:ent.weaponKey,age:0});
       addBlood(ent.x,ent.y,12);sfx.death();
+      const _dw=ent.weaponKey==="knife"?"pistol":ent.weaponKey;
+      drops.push({x:ent.x+rand(-14,14),y:ent.y+rand(-14,14),weaponKey:_dw,mag:CONFIG.weapons[_dw]?.mag||0,reserve:0});
     }else if(b.alive===true&&!ent.alive){
       ent.alive=true;ent.hp=b.hp;
     }
