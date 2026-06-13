@@ -60,7 +60,7 @@ const CONFIG = {
               range:46, arc:90*RAD, noise:120, speedMult:1.22, rollMult:1.65 }
   },
   killEffect: { slowDur:0.22, slowScale:0.15 },
-  round: { preTime: 1.0, buyTime: 7.0, endTime: 0.4, resultTime: 2.2 },
+  round: { preTime: 0.5, buyTime: 7.0, endTime: 0.4, resultTime: 2.2 },
   economy: { start:1000, win:500, loss:300, kill:200, head:100, knife:200 },
   world: { w: 1800, h: 1200 },
   debug: false   // F1 토글: 봇 상태/시야 표시
@@ -380,6 +380,7 @@ function addBloodStain(x,y,r,life){
 }
 let shake=0,hitFlash=0,hitMarker=0,deathT=0,buyFlash=0;
 let deathKiller=null;   // {name, weapon} — 나를 죽인 상대
+let specTarget=null;    // 관전 대상 엔티티
 const killerImg=new Image();killerImg.src="assets/charactor01.png";
 let roundBannerT=0;     // 라운드 시작 배너 타이머
 let showScoreboard=false;
@@ -489,7 +490,9 @@ function fireHitscan(shooter,wp,ang){
   if(best){
     ex=ox+dx*best.t;ey=oy+dy*best.t;
     const head=best.dd<best.e.headR;
-    const dmg=head?wp.dmg*wp.headMult:wp.dmg;
+    let dmg=head?wp.dmg*wp.headMult:wp.dmg;
+    // 시야 밖 적: 50% 피해 감소 (무작위 스프레이 억제)
+    if(shooter===player&&!visibleToCam(best.e))dmg=Math.round(dmg*0.5);
     let skipApply=false;
     if(ws&&ws.readyState===1){
       if(gameMode==="1v1"&&shooter===player&&best.e===remoteEntity){
@@ -706,6 +709,17 @@ addEventListener("keydown",ev=>{
     buyMenuOpen=!buyMenuOpen;return;
   }
   if(buyMenuOpen)return;
+  // 관전 단축키 (사망 후 5.2초 경과)
+  if(player&&!player.alive&&deathT>5.2&&gameState==="game"){
+    const _st0=entities.filter(e=>e.team===0&&e!==player);
+    const _st1=entities.filter(e=>e.team===1);
+    if(ev.code==="Digit1"){specTarget=_st0[0]||null;return;}
+    if(ev.code==="Digit2"){specTarget=_st0[1]||null;return;}
+    if(ev.code==="Digit3"){specTarget=_st0[2]||null;return;}
+    if(ev.code==="KeyQ"){specTarget=_st1[0]||null;return;}
+    if(ev.code==="KeyW"){specTarget=_st1[1]||null;return;}
+    if(ev.code==="KeyE"){specTarget=_st1[2]||null;return;}
+  }
   if(!player||!player.alive||round.state!=="play")return;
   if(ev.code==="KeyR")startReload(player);
   if(ev.code==="Digit1"){if(player.ammo[chosenWeapon])switchWeapon(player,chosenWeapon);}
@@ -784,21 +798,36 @@ addEventListener("mousedown",ev=>{
     return;
   }
   if(gameState==="menu"){
-    const bw=480,bh=70,bx=W/2-bw/2;
-    gameModes.forEach((m,i)=>{
-      const by=H/2-78+i*84;
-      if(ev.clientX>=bx&&ev.clientX<=bx+bw&&ev.clientY>=by&&ev.clientY<=by+bh){
-        if(menuModeIdx===i&&m.ready){
-          if(m.key==="online"){lobbyGameMode="1v1";gameState="lobby";connectToServer();}
-          else if(m.key==="coop2"){lobbyGameMode="coop2";gameState="lobby";connectToServer();}
-          else if(m.key==="coop3"){lobbyGameMode="coop3";gameState="lobby";connectToServer();}
-          else gameState="title";
-        }else{menuModeIdx=i;}
-      }
-    });
-    // 키 안내 버튼
-    const kgbw2=130,kgbx2=W/2-kgbw2/2,kgby2=H/2+196;
-    if(ev.clientX>=kgbx2&&ev.clientX<=kgbx2+kgbw2&&ev.clientY>=kgby2&&ev.clientY<=kgby2+30){showKeyGuide=true;}
+    if(menuDepth===0){
+      const bw=480,bh=70,bx=W/2-bw/2;
+      mainItems.forEach((m,i)=>{
+        const by=H/2-54+i*84;
+        if(ev.clientX>=bx&&ev.clientX<=bx+bw&&ev.clientY>=by&&ev.clientY<=by+bh){
+          if(menuMainIdx===i){
+            audioInit();
+            if(m.key==="solo"){gameState="title";}
+            else if(m.key==="together"){menuDepth=1;menuSubIdx=0;}
+            else if(m.key==="keys"){showKeyGuide=true;}
+          }else{menuMainIdx=i;}
+        }
+      });
+    }else{
+      // 뒤로 버튼
+      const bbw=120,bbx=W/2-300,bby=H/2-140;
+      if(ev.clientX>=bbx&&ev.clientX<=bbx+bbw&&ev.clientY>=bby&&ev.clientY<=bby+32){menuDepth=0;return;}
+      const bw=480,bh=58,bx=W/2-bw/2;
+      togetherItems.forEach((t,i)=>{
+        const by=H/2-90+i*70;
+        if(ev.clientX>=bx&&ev.clientX<=bx+bw&&ev.clientY>=by&&ev.clientY<=by+bh){
+          if(menuSubIdx===i&&t.ready){
+            audioInit();
+            if(t.key==="coop2"){lobbyGameMode="coop2";gameState="lobby";connectToServer();}
+            else if(t.key==="coop3"){lobbyGameMode="coop3";gameState="lobby";connectToServer();}
+            else if(t.key==="1v1"){lobbyGameMode="1v1";gameState="lobby";connectToServer();}
+          }else{menuSubIdx=i;}
+        }
+      });
+    }
     return;
   }
   if(gameState==="title"){
@@ -1121,13 +1150,20 @@ const weaponChoices=[
   {key:"smg", label:"SMG",  desc:"빠른 연사   |  빠른 이동  |  단거리 최강"},
 ];
 let titleWeaponIdx=0;
-const gameModes=[
-  {key:"online",  label:"온라인 1 vs 1",   desc:"방 코드 공유  |  인터넷 실시간  |  1순위",           ready:true},
-  {key:"versus",  label:"AI 대전",          desc:"3 vs 3 봇 전투  |  라운드제  |  혼자 플레이",    ready:true},
-  {key:"coop2",   label:"협동 2인 vs AI",  desc:"2인 협동  |  봇 3마리 상대  |  방 코드 공유",     ready:true},
-  {key:"coop3",   label:"협동 3인 vs AI",  desc:"3인 협동  |  봇 4마리 상대  |  방 코드 공유",     ready:true},
+// ── 메인 메뉴 2단 구조 ────────────────────────────
+const mainItems=[
+  {key:"solo",     label:"혼자하기", desc:"AI 대전  |  오프라인  |  무기 선택 후 시작"},
+  {key:"together", label:"같이하기", desc:"온라인  |  협동 또는 대전  |  방 코드 공유"},
+  {key:"keys",     label:"키  안내", desc:"조작법 확인"},
 ];
-let menuModeIdx=0;
+const togetherItems=[
+  {key:"coop2", label:"협동 2인 vs AI", desc:"2인 팀  |  봇 3마리 상대  |  방 코드 공유", ready:true},
+  {key:"coop3", label:"협동 3인 vs AI", desc:"3인 팀  |  봇 4마리 상대  |  방 코드 공유", ready:true},
+  {key:"1v1",   label:"대전 1 vs 1",   desc:"1:1 온라인  |  방 코드 공유  |  인터넷 실시간", ready:true},
+  {key:"2v2",   label:"대전 2 vs 2",   desc:"팀 대전  |  향후 추가 예정", ready:false},
+  {key:"3v3",   label:"대전 3 vs 3",   desc:"팀 대전  |  향후 추가 예정", ready:false},
+];
+let menuDepth=0, menuMainIdx=0, menuSubIdx=0;
 
 addEventListener("keydown",ev=>{
   if(ev.code==="Space")ev.preventDefault();
@@ -1155,19 +1191,30 @@ addEventListener("keydown",ev=>{
     return;
   }
   if(gameState==="menu"){
-    if(ev.code==="ArrowUp"){menuModeIdx=(menuModeIdx+gameModes.length-1)%gameModes.length;}
-    if(ev.code==="ArrowDown"){menuModeIdx=(menuModeIdx+1)%gameModes.length;}
-    if(ev.code==="Enter"||ev.code==="Space"){
-      ev.preventDefault();audioInit();
-      const m=gameModes[menuModeIdx];
-      if(m.ready){
-        if(m.key==="online"){lobbyGameMode="1v1";gameState="lobby";connectToServer();}
-        else if(m.key==="coop2"){lobbyGameMode="coop2";gameState="lobby";connectToServer();}
-        else if(m.key==="coop3"){lobbyGameMode="coop3";gameState="lobby";connectToServer();}
-        else gameState="title";
+    if(menuDepth===0){
+      if(ev.code==="ArrowUp")menuMainIdx=(menuMainIdx+mainItems.length-1)%mainItems.length;
+      if(ev.code==="ArrowDown")menuMainIdx=(menuMainIdx+1)%mainItems.length;
+      if(ev.code==="Enter"||ev.code==="Space"){
+        ev.preventDefault();audioInit();
+        const m=mainItems[menuMainIdx];
+        if(m.key==="solo"){gameState="title";}
+        else if(m.key==="together"){menuDepth=1;menuSubIdx=0;}
+        else if(m.key==="keys"){showKeyGuide=true;}
+      }
+    }else{
+      if(ev.code==="ArrowUp")menuSubIdx=(menuSubIdx+togetherItems.length-1)%togetherItems.length;
+      if(ev.code==="ArrowDown")menuSubIdx=(menuSubIdx+1)%togetherItems.length;
+      if(ev.code==="Escape"){menuDepth=0;return;}
+      if(ev.code==="Enter"||ev.code==="Space"){
+        ev.preventDefault();audioInit();
+        const t=togetherItems[menuSubIdx];
+        if(t.ready){
+          if(t.key==="coop2"){lobbyGameMode="coop2";gameState="lobby";connectToServer();}
+          else if(t.key==="coop3"){lobbyGameMode="coop3";gameState="lobby";connectToServer();}
+          else if(t.key==="1v1"){lobbyGameMode="1v1";gameState="lobby";connectToServer();}
+        }
       }
     }
-    if(ev.code==="Escape"){}
     return;
   }
   if(gameState==="title"){
@@ -1195,7 +1242,7 @@ function newRound(){
   round.n++;round.state="pre";round.t=CONFIG.round.preTime;
   entities.length=0;corpses.length=0;drops.length=0;rings.length=0;floatTexts.length=0;
   tracers.length=0;particles.length=0;flashes.length=0;bloodStains.length=0;
-  scoped=false;scopeZoom=3.2;killSlowT=0;killFlash=0;timeScale=1;deathT=0;deathKiller=null;setDeathAudio(false);
+  scoped=false;scopeZoom=3.2;killSlowT=0;killFlash=0;timeScale=1;deathT=0;deathKiller=null;specTarget=null;setDeathAudio(false);
   roll={active:false,t:0,dirX:0,dirY:0,cd:0,chainWin:0};
   player=makeEntity(0,spawns[0][1].x,spawns[0][1].y,false,"YOU");
   // 선택 무기 장착
@@ -1280,19 +1327,21 @@ function compileResult(iWin){
 let camRX=0,camRY=0;
 function camEnt(){
   if(player&&player.alive)return player;
-  if(netState==="playing")return player;
-  // 사망 후 연출(vignette→showcase→블랙) 중에는 사망 위치 고정
-  // 7.5s 이후 블랙 화면이 완전히 깔린 상태에서 관전 대상으로 전환
+  // 사망 연출 중 고정
   if(player&&!player.alive&&deathT<5.2)return player;
-  return entities.find(e=>e.team===0&&e.alive)||player;
+  // 관전 대상 수동 선택
+  if(specTarget&&specTarget.alive)return specTarget;
+  // 자동: 아군 → 적 순으로 살아있는 엔티티
+  return entities.find(e=>e.team===0&&e.alive)||entities.find(e=>e.alive)||player;
 }
 function camX(){const c=camEnt();return c?c.x:WORLD.w/2;}
 function camY(){const c=camEnt();return c?c.y:WORLD.h/2;}
 function visibleToCam(e){
   const c=camEnt();
   if(!c)return false;
+  // 적 관전 중: 모든 엔티티 표시
+  if(specTarget&&specTarget.team===1)return true;
   if(e.team===0)return true;
-  // 스코프 중이면 좁은 FOV + 긴 사거리로 판정
   if(scoped&&c===player){
     const awp=CONFIG.weapons.awp;
     return canSee(c,e,awp.scopeFov,awp.scopeDist);
@@ -1589,7 +1638,7 @@ function render(){
 
   // ---- 전장의 안개 ----
   const ce=camEnt();
-  if(ce&&ce.alive){
+  if(ce&&ce.alive&&!(specTarget&&specTarget.team===1)){
     fctx.clearRect(0,0,W,H);
     fctx.fillStyle=`rgba(6,8,12,${CONFIG.vision.fogAlpha})`;
     fctx.fillRect(0,0,W,H);
@@ -2183,12 +2232,51 @@ function renderHUD(){
       const alpha=elapsed<0.8?0.97:clamp(1.0-(elapsed-0.8)/0.5,0,0.97);
       if(alpha>0){ctx.fillStyle=`rgba(0,0,0,${alpha})`;ctx.fillRect(0,0,W,H);}
     }
-    // 관전 중 표시: 딜레이 끝나고 페이드인
+    // 관전 중 표시 + 단축키 힌트
     if(deathT>5.4){
       const ia=clamp((deathT-5.4)/0.4,0,0.85);
       ctx.save();ctx.globalAlpha=ia;
-      ctx.font="bold 15px monospace";ctx.fillStyle="#ff8080";ctx.textAlign="left";
-      ctx.fillText("▶ 관전 중",24,H-24);
+      const _st0=entities.filter(e=>e.team===0&&e!==player);
+      const _st1=entities.filter(e=>e.team===1);
+      const _keys0=["1","2","3"],_keys1=["Q","W","E"];
+      const bH=28,bPad=10,totalH=bH+8;
+      let bx=16,by=H-totalH-8;
+      ctx.font="bold 15px monospace";
+      // "관전 중" 레이블
+      ctx.fillStyle="rgba(255,100,100,0.9)";ctx.textAlign="left";
+      ctx.fillText("▶ 관전 중",bx,by+bH*0.72);
+      bx+=90;
+      // 아군 버튼
+      _st0.forEach((e,i)=>{
+        if(i>2)return;
+        const lbl=`[${_keys0[i]}] ${e.name}`;
+        const tw=ctx.measureText(lbl).width+bPad*2;
+        const sel=specTarget===e;
+        ctx.fillStyle=sel?"rgba(80,160,240,0.9)":"rgba(30,50,80,0.75)";
+        ctx.strokeStyle=sel?"#60b0f0":"rgba(60,100,140,0.7)";ctx.lineWidth=1;
+        rr(bx,by,tw,bH,4);ctx.fill();ctx.stroke();
+        ctx.fillStyle=sel?"#ffffff":"#88b8e0";ctx.textAlign="left";
+        ctx.fillText(lbl,bx+bPad,by+bH*0.72);
+        bx+=tw+6;
+      });
+      // 구분선
+      if(_st1.length>0){
+        ctx.fillStyle="rgba(150,150,150,0.4)";ctx.fillRect(bx+2,by+4,1,bH-8);
+        bx+=12;
+      }
+      // 적 버튼
+      _st1.forEach((e,i)=>{
+        if(i>2)return;
+        const lbl=`[${_keys1[i]}] ${e.name}`;
+        const tw=ctx.measureText(lbl).width+bPad*2;
+        const sel=specTarget===e;
+        ctx.fillStyle=sel?"rgba(220,80,80,0.9)":"rgba(60,20,20,0.75)";
+        ctx.strokeStyle=sel?"#e06060":"rgba(120,50,50,0.7)";ctx.lineWidth=1;
+        rr(bx,by,tw,bH,4);ctx.fill();ctx.stroke();
+        ctx.fillStyle=sel?"#ffffff":"#e09090";ctx.textAlign="left";
+        ctx.fillText(lbl,bx+bPad,by+bH*0.72);
+        bx+=tw+6;
+      });
       ctx.restore();
     }
   }
@@ -2475,47 +2563,79 @@ function renderMatchEnd(){
 }
 function renderResult(){
   const r=round.result;if(!r)return;
-  const pw=480,ph=300,px=W/2-pw/2,py=H/2-ph/2;
-  ctx.fillStyle="rgba(0,0,0,0.82)";ctx.fillRect(0,0,W,H);
-  ctx.fillStyle=r.win?"rgba(8,26,12,0.97)":"rgba(26,8,8,0.97)";
-  ctx.strokeStyle=r.win?"#2a8a4a":"#8a2a2a";ctx.lineWidth=2;
+  const pw=500,ph=290,px=W/2-pw/2,py=H/2-ph/2;
+  const win=r.win;
+  const ac=win?"#4cd47a":"#e84040";
+  const acDark=win?"rgba(10,38,18,0.97)":"rgba(38,10,10,0.97)";
+  const acMid=win?"#2a7a3a":"#7a2a2a";
+
+  // 배경
+  ctx.fillStyle="rgba(0,0,0,0.78)";ctx.fillRect(0,0,W,H);
+  ctx.fillStyle=acDark;ctx.strokeStyle=acMid;ctx.lineWidth=2;
   rr(px,py,pw,ph,14);ctx.fill();ctx.stroke();
-  ctx.fillStyle=r.win?"#2a8a4a":"#8a2a2a";rr(px+1,py+1,pw-2,5,3);ctx.fill();
-  ctx.textAlign="center";
-  ctx.font="bold 15px monospace";ctx.fillStyle="rgba(200,220,240,0.4)";
-  ctx.fillText("RESULT",W/2,py+22);
-  ctx.font="bold 36px monospace";ctx.fillStyle=r.win?"#4cd47a":"#e84040";
-  ctx.fillText(r.win?"라운드 승리":"라운드 패배",W/2,py+62);
+
+  // ── 헤더 바 (승/패 + 라운드 번호)
+  const hh=48;
+  ctx.fillStyle=acMid;rr(px+1,py+1,pw-2,hh,12);ctx.fill();
+  ctx.textAlign="left";ctx.font="bold 26px monospace";ctx.fillStyle="#ffffff";
+  ctx.fillText(win?"  ▲  라운드 승리":"  ▼  라운드 패배",px+10,py+hh*0.68);
+  ctx.textAlign="right";ctx.font="bold 15px monospace";ctx.fillStyle="rgba(255,255,255,0.55)";
+  ctx.fillText(`ROUND ${round.n}`,px+pw-16,py+hh*0.68);
+
+  // ── 스코어 (내 점수 vs 상대)
   const ms=r.scores[r.myTeam],ts=r.scores[1-r.myTeam];
-  ctx.font="15px monospace";ctx.fillStyle="rgba(180,195,215,0.7)";
-  ctx.fillText(`${ms}  :  ${ts}`,W/2,py+84);
+  ctx.textAlign="center";
+  ctx.font="bold 42px monospace";ctx.fillStyle=ac;ctx.fillText(`${ms}`,W/2-44,py+hh+52);
+  ctx.font="bold 28px monospace";ctx.fillStyle="rgba(160,180,200,0.5)";ctx.fillText(":",W/2,py+hh+50);
+  ctx.font="bold 42px monospace";ctx.fillStyle="rgba(200,210,220,0.6)";ctx.fillText(`${ts}`,W/2+44,py+hh+52);
+  ctx.font="15px monospace";ctx.fillStyle="rgba(120,140,160,0.55)";
+  ctx.fillText("내 팀",W/2-44,py+hh+68);ctx.fillText("상대",W/2+44,py+hh+68);
+
   // 구분선
+  const div1=py+hh+82;
+  ctx.strokeStyle="rgba(255,255,255,0.08)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(px+20,div1);ctx.lineTo(px+pw-20,div1);ctx.stroke();
+
+  // ── 핵심 3열 (킬 / 머니 획득 / 잔액)
+  const ry2=div1+14;
+  const cols=[
+    {label:"킬",        val:`${r.kills}`,          color:r.kills>0?ac:"#8899aa"},
+    {label:"머니 획득",  val:`+${r.moneyGain}`,     color:"#c8e870"},
+    {label:"잔  액",    val:`$${r.totalMoney}`,     color:"#b8d070"},
+  ];
+  const cw3=pw/3;
+  cols.forEach((c,i)=>{
+    const cx=px+cw3*i+cw3/2;
+    ctx.textAlign="center";
+    ctx.font="13px monospace";ctx.fillStyle="rgba(140,160,180,0.55)";
+    ctx.fillText(c.label,cx,ry2+14);
+    ctx.font="bold 26px monospace";ctx.fillStyle=c.color;
+    ctx.fillText(c.val,cx,ry2+42);
+  });
+
+  // 구분선
+  const div2=ry2+56;
   ctx.strokeStyle="rgba(255,255,255,0.07)";ctx.lineWidth=1;
-  ctx.beginPath();ctx.moveTo(px+24,py+96);ctx.lineTo(px+pw-24,py+96);ctx.stroke();
-  // Stats 그리드
-  const col=(bx,by,label,val,color)=>{
-    ctx.font="15px monospace";ctx.fillStyle="rgba(140,160,180,0.6)";ctx.textAlign="left";
-    ctx.fillText(label,bx,by);
-    ctx.font="bold 15px monospace";ctx.fillStyle=color||"#d0dce8";
-    ctx.fillText(val,bx,by+20);
-  };
-  const lx=px+30,ry=py+114;
-  col(lx,       ry,"KILLS",r.kills,"#4cd47a");
-  col(lx+100,   ry,"HEADSHOTS",r.heads,"#f9d74a");
-  col(lx+220,   ry,"KNIFE KILLS",r.knifeKills,"#ff9940");
-  col(lx+340,   ry,"LONG KILL",r.maxDist?`${Math.round(r.maxDist/50)}m`:"—","#88ccff");
-  // 무기
+  ctx.beginPath();ctx.moveTo(px+20,div2);ctx.lineTo(px+pw-20,div2);ctx.stroke();
+
+  // ── 세부 stats (작은 텍스트)
   const wpName=CONFIG.weapons[r.weapon]?.name||r.weapon;
-  col(lx,ry+48,"WEAPON",wpName,"#9fb3c8");
-  // 획득 자금
-  col(lx+160,ry+48,"EARNED",`+${r.moneyGain}`,"#c8e870");
-  col(lx+280,ry+48,"BALANCE",`$${r.totalMoney}`,"#b8d070");
-  // 진행 바 (남은 시간)
+  const details=[
+    `헤드샷 ${r.heads}`,
+    `칼킬 ${r.knifeKills}`,
+    r.maxDist?`최장거리 ${Math.round(r.maxDist/50)}m`:"최장거리 —",
+    `무기 ${wpName}`,
+  ];
+  ctx.textAlign="center";ctx.font="13px monospace";ctx.fillStyle="rgba(120,140,165,0.7)";
+  ctx.fillText(details.join("  ·  "),W/2,div2+18);
+
+  // ── 진행 바 + 레이블
   const prog=1-round.t/CONFIG.round.resultTime;
-  ctx.fillStyle="rgba(255,255,255,0.06)";ctx.fillRect(px+24,py+ph-22,pw-48,4);
-  ctx.fillStyle=r.win?"#2a7a3a":"#7a2a2a";ctx.fillRect(px+24,py+ph-22,(pw-48)*prog,4);
-  ctx.font="15px sans-serif";ctx.fillStyle="rgba(120,140,160,0.5)";ctx.textAlign="center";
-  ctx.fillText("다음 라운드 준비 중...",W/2,py+ph-6);
+  const barY=py+ph-18;
+  ctx.fillStyle="rgba(255,255,255,0.07)";ctx.fillRect(px+16,barY-4,pw-32,4);
+  ctx.fillStyle=acMid;ctx.fillRect(px+16,barY-4,(pw-32)*prog,4);
+  ctx.font="13px sans-serif";ctx.fillStyle="rgba(120,140,160,0.45)";
+  ctx.fillText("다음 라운드 준비 중...",W/2,barY+10);
 }
 
 function renderScoreboard(){
@@ -2699,7 +2819,7 @@ function startOnlineGame(){
   const isFirstGame=(round.n===0);
   entities.length=0;corpses.length=0;drops.length=0;rings.length=0;floatTexts.length=0;
   tracers.length=0;particles.length=0;flashes.length=0;bloodStains.length=0;
-  scoped=false;scopeZoom=3.2;killSlowT=0;killFlash=0;timeScale=1;deathT=0;deathKiller=null;setDeathAudio(false);
+  scoped=false;scopeZoom=3.2;killSlowT=0;killFlash=0;timeScale=1;deathT=0;deathKiller=null;specTarget=null;setDeathAudio(false);
   roll={active:false,t:0,dirX:0,dirY:0,cd:0,chainWin:0};
   round.scored=false;round.result=null;
   remoteEntities={};
@@ -3056,72 +3176,76 @@ function renderKeyGuide(){
   ctx.fillStyle="#0af";ctx.beginPath();ctx.arc(mouse.x,mouse.y,2,0,TAU);ctx.fill();
 }
 
-function renderMenu(){
+function _menuBtn(bx,by,bw,bh,sel,dim,label,desc,accent){
+  ctx.fillStyle=sel&&!dim?"#0e1d2e":(sel?"rgba(18,22,28,0.7)":"rgba(12,16,22,0.6)");
+  ctx.strokeStyle=sel&&!dim?accent:(sel?"#2a3a4a":"#1e2a38");
+  ctx.lineWidth=sel?2:1;
+  rr(bx,by,bw,bh,10);ctx.fill();ctx.stroke();
+  if(sel&&!dim){ctx.fillStyle=accent;rr(bx,by+12,4,bh-24,2);ctx.fill();}
+  ctx.textAlign="left";
+  ctx.font=`bold ${sel?22:19}px monospace`;
+  ctx.fillStyle=dim?"#3a4a5a":(sel?accent:"#8aa8c8");
+  ctx.fillText(label,bx+24,by+bh*0.46);
+  if(desc){ctx.font="15px sans-serif";ctx.fillStyle=dim?"#2e3a46":"#445566";ctx.fillText(desc,bx+24,by+bh*0.8);}
+  if(dim){
+    const tw=ctx.measureText("준비중").width+16;
+    ctx.fillStyle="rgba(40,55,70,0.9)";rr(bx+bw-tw-14,by+bh/2-11,tw,22,4);ctx.fill();
+    ctx.fillStyle="#4a6070";ctx.font="bold 13px monospace";ctx.textAlign="left";
+    ctx.fillText("준비중",bx+bw-tw-6,by+bh/2+4);
+  }
+  if(sel&&!dim){
+    ctx.textAlign="right";ctx.font="bold 20px monospace";ctx.fillStyle=accent;
+    ctx.fillText("▶",bx+bw-16,by+bh*0.63);
+  }
   ctx.textAlign="center";
+}
+function renderMenu(){
   // 타이틀
-  ctx.fillStyle="#dfe6ef";
-  ctx.font="bold 58px monospace";
-  ctx.fillText("BLOCK WAR",W/2,H/2-168);
+  ctx.textAlign="center";
+  ctx.fillStyle="#dfe6ef";ctx.font="bold 58px monospace";
+  ctx.fillText("BLOCK WAR",W/2,H/2-190);
   ctx.font="15px sans-serif";ctx.fillStyle="#6a8a9a";
-  ctx.fillText("적을 찾아라  ·  들어라  ·  예측하라  ·  먼저 쏴라",W/2,H/2-124);
+  ctx.fillText("적을 찾아라  ·  들어라  ·  예측하라  ·  먼저 쏴라",W/2,H/2-150);
+  ctx.strokeStyle="rgba(80,110,140,0.3)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(W/2-220,H/2-132);ctx.lineTo(W/2+220,H/2-132);ctx.stroke();
 
-  // 구분선
-  ctx.strokeStyle="rgba(80,110,140,0.35)";ctx.lineWidth=1;
-  ctx.beginPath();ctx.moveTo(W/2-220,H/2-106);ctx.lineTo(W/2+220,H/2-106);ctx.stroke();
+  if(menuDepth===0){
+    // ── 메인 (3개) ──────────────────────────
+    ctx.font="bold 15px monospace";ctx.fillStyle="#4a6070";ctx.textAlign="center";
+    ctx.fillText("▲ ▼ 선택    Enter 또는 클릭",W/2,H/2-112);
+    const bw=480,bh=70,bx=W/2-bw/2;
+    mainItems.forEach((m,i)=>{
+      const by=H/2-98+i*84;
+      const sel=i===menuMainIdx;
+      const accent=m.key==="solo"?"#4cd47a":m.key==="together"?"#3a80cc":"#8899aa";
+      _menuBtn(bx,by,bw,bh,sel,false,m.label,m.desc,accent);
+    });
+  }else{
+    // ── 같이하기 서브메뉴 ────────────────────
+    // 뒤로 버튼
+    const bbx=W/2-300,bby=H/2-148;
+    const bbHov=mouse.x>=bbx&&mouse.x<=bbx+120&&mouse.y>=bby&&mouse.y<=bby+30;
+    ctx.fillStyle=bbHov?"rgba(30,50,80,0.9)":"rgba(18,28,48,0.8)";
+    ctx.strokeStyle=bbHov?"#4a8aca":"#2a4a6a";ctx.lineWidth=1;
+    rr(bbx,bby,120,30,6);ctx.fill();ctx.stroke();
+    ctx.font="bold 15px monospace";ctx.fillStyle=bbHov?"#aadeff":"#5a8abb";
+    ctx.textAlign="left";ctx.fillText("← 뒤로",bbx+12,bby+20);
 
-  const bw=480,bh=70,bx=W/2-bw/2;
-  ctx.font="bold 15px monospace";ctx.fillStyle="#4a6070";
-  ctx.fillText("▲ ▼  모드 선택     Enter 또는 클릭",W/2,H/2-90);
+    ctx.textAlign="center";ctx.font="bold 22px monospace";ctx.fillStyle="#7ab8ee";
+    ctx.fillText("같이하기",W/2,H/2-108);
+    ctx.font="15px monospace";ctx.fillStyle="#4a6070";
+    ctx.fillText("▲ ▼  모드 선택     Enter 또는 클릭     ESC 뒤로",W/2,H/2-84);
 
-  gameModes.forEach((m,i)=>{
-    const by=H/2-78+i*84;
-    const sel=i===menuModeIdx;
-    const dim=!m.ready;
-    // 배경 박스
-    ctx.fillStyle=sel&&m.ready?"#0e1d2e":(sel?"rgba(18,22,28,0.7)":"rgba(12,16,22,0.6)");
-    ctx.strokeStyle=sel&&m.ready?"#3a80cc":(sel?"#2a3a4a":"#1e2a38");
-    ctx.lineWidth=sel?2:1;
-    rr(bx,by,bw,bh,10);ctx.fill();ctx.stroke();
-    // 좌측 악센트 바
-    if(sel&&m.ready){
-      ctx.fillStyle="#3a80cc";
-      rr(bx,by+12,4,bh-24,2);ctx.fill();
-    }
-    // 모드명
-    ctx.textAlign="left";
-    ctx.font=`bold ${sel?22:19}px monospace`;
-    ctx.fillStyle=dim?"#3a4a5a":(sel?"#7ab8ee":"#8aa8c8");
-    ctx.fillText(m.label,bx+24,by+30);
-    // 설명
-    ctx.font="15px sans-serif";
-    ctx.fillStyle=dim?"#2e3a46":"#445566";
-    ctx.fillText(m.desc,bx+24,by+52);
-    // 준비중 뱃지
-    if(dim){
-      ctx.font="bold 15px monospace";ctx.fillStyle="#334455";
-      const tw=ctx.measureText("준비중").width+16;
-      ctx.fillStyle="rgba(40,55,70,0.9)";
-      rr(bx+bw-tw-14,by+24,tw,22,4);ctx.fill();
-      ctx.fillStyle="#4a6070";ctx.font="bold 15px monospace";ctx.textAlign="left";
-      ctx.fillText("준비중",bx+bw-tw-6,by+39);
-    }
-    // 선택 화살표
-    if(sel&&m.ready){
-      ctx.textAlign="right";
-      ctx.font="bold 20px monospace";ctx.fillStyle="#3a80cc";
-      ctx.fillText("▶",bx+bw-16,by+44);
-    }
-    ctx.textAlign="center";
-  });
+    const bw=480,bh=58,bx=W/2-bw/2;
+    togetherItems.forEach((t,i)=>{
+      const by=H/2-68+i*68;
+      const sel=i===menuSubIdx;
+      const accent=t.key.startsWith("coop")?"#f0a040":t.key==="1v1"?"#3a80cc":"#556677";
+      _menuBtn(bx,by,bw,bh,sel,!t.ready,t.label,t.desc,accent);
+    });
+  }
 
-  const kgbw=130,kgbh=30,kgbx=W/2-kgbw/2,kgby=H/2+196;
-  const kgHov=mouse.x>=kgbx&&mouse.x<=kgbx+kgbw&&mouse.y>=kgby&&mouse.y<=kgby+kgbh;
-  ctx.fillStyle=kgHov?"rgba(20,55,95,0.92)":"rgba(10,28,52,0.82)";
-  ctx.strokeStyle=kgHov?"#4a8aca":"#1e4060";ctx.lineWidth=1.5;
-  rr(kgbx,kgby,kgbw,kgbh,6);ctx.fill();ctx.stroke();
-  ctx.font="bold 15px monospace";ctx.fillStyle=kgHov?"#88d8ff":"#3a88cc";
-  ctx.textAlign="center";ctx.fillText("⌨  키 안내",W/2,kgby+kgbh*0.65);
-  ctx.font="15px sans-serif";ctx.fillStyle="rgba(60,80,100,0.7)";
+  ctx.font="15px sans-serif";ctx.fillStyle="rgba(60,80,100,0.7)";ctx.textAlign="center";
   ctx.fillText("© BLOCK WAR ALPHA  —  eser.lbs@gmail.com",W/2,H-16);
   ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(mouse.x,mouse.y,3,0,TAU);ctx.fill();
 }
